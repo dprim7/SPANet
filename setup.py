@@ -7,7 +7,7 @@ long_description = (this_directory / "README.md").read_text()
 setup(
     name="spanet",
     packages=find_packages(),
-    version="2.2.0",
+    version="2.3.0",
     description="Symmetry Preserving Attention Networks",
     long_description=long_description,
     long_description_content_type='text/markdown',
