@@ -8,6 +8,7 @@ from spanet.dataset.inputs.BaseInput import BaseInput
 from spanet.dataset.inputs.GlobalInput import GlobalInput
 from spanet.dataset.inputs.RelativeInput import RelativeInput
 from spanet.dataset.inputs.SequentialInput import SequentialInput
+from spanet.dataset.inputs.AttentionBiasInput import AttentionBiasInput
 
 
 def create_source_input(
@@ -21,6 +22,7 @@ def create_source_input(
         InputType.Sequential: SequentialInput,
         InputType.Relative: RelativeInput,
         InputType.Global: GlobalInput,
+        InputType.AttentionBiases: AttentionBiasInput,
     }[event_info.input_type(input_name)]
 
     return source_class(event_info, hdf5_file, input_name, num_events, limit_index)

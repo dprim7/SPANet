@@ -1,5 +1,5 @@
 from itertools import islice
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -71,7 +71,7 @@ class SymmetricAttentionSplit(SymmetricAttentionBase):
 
         return operations + result
 
-    def forward(self, x: Tensor, padding_mask: Tensor, sequence_mask: Tensor) -> Tuple[Tensor, List[Tensor]]:
+    def forward(self, x: Tensor, padding_mask: Tensor, sequence_mask: Tensor, attention_bias: Optional[Tensor] = None) -> Tuple[Tensor, List[Tensor]]:
         """ Perform symmetric attention on the hidden vectors and produce the output logits.
 
         This is the approximate version which learns embedding layers and computes a trivial linear form.
@@ -120,6 +120,13 @@ class SymmetricAttentionSplit(SymmetricAttentionBase):
         # -------------------------------------------------------
         output = torch.einsum(self.contraction_operation, *ys)
         output = output / self.weights_scale
+
+        # Apply attention bias AFTER tensor contraction but BEFORE symmetrization
+        if attention_bias is not None:
+            # attention_bias should have shape [B, T, T] for degree=2
+            # output has shape [B, T, T] for degree=2
+            # Add bias values to attention scores (pre-softmax)
+            output = output + attention_bias
 
         # ---------------------------------------------------
         # Symmetrize the output according to group structure.

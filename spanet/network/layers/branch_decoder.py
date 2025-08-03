@@ -1,4 +1,4 @@
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from opt_einsum import contract_expression
 
 import torch
@@ -101,6 +101,7 @@ class BranchDecoder(nn.Module):
             padding_mask: Tensor,
             sequence_mask: Tensor,
             global_mask: Tensor,
+            ak_overlap_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """ Create a distribution over jets for a given particle and a probability of its existence.
 
@@ -151,7 +152,8 @@ class BranchDecoder(nn.Module):
         assignment, daughter_vectors = self.attention(
             sequential_particle_vectors,
             sequential_padding_mask,
-            sequential_sequence_mask
+            sequential_sequence_mask,
+            attention_bias=ak_overlap_mask
         )
 
         assignment_mask = self.create_output_mask(assignment, sequential_sequence_mask)

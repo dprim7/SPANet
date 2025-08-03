@@ -131,7 +131,7 @@ class SpecialKey(str, Enum):
 class Source(NamedTuple):
     data: Tensor
     mask: Tensor
-
+    ak_overlap_mask: Optional[Tensor] = None  # Actually attention bias values, not mask  
 
 class Statistics(NamedTuple):
     location: Tensor
@@ -142,6 +142,8 @@ class InputType(str, Enum):
     Global = "GLOBAL"
     Relative = "RELATIVE"
     Sequential = "SEQUENTIAL"
+    AttentionMasks = "ATTENTION_MASKS" 
+    AttentionBiases = "ATTENTION_BIASES" 
 
 
 class AssignmentTargets(NamedTuple):

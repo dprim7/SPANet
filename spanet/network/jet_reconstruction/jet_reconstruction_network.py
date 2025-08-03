@@ -82,6 +82,13 @@ class JetReconstructionNetwork(JetReconstructionBase):
         # Embed all of the different input regression_vectors into the same latent space.
         embeddings, padding_masks, sequence_masks, global_masks = self.embedding(sources)
 
+        # Extract attention bias data if present in any source
+        attention_bias = None
+        for source in sources:
+            if source.ak_overlap_mask is not None:
+                attention_bias = source.ak_overlap_mask
+                break
+
         # Extract features from data using transformer
         hidden, event_vector = self.encoder(embeddings, padding_masks, sequence_masks)
 
@@ -101,7 +108,7 @@ class JetReconstructionNetwork(JetReconstructionBase):
                 assignment_mask,
                 event_particle_vector,
                 product_particle_vectors
-            ) = decoder(hidden, padding_masks, sequence_masks, global_masks)
+            ) = decoder(hidden, padding_masks, sequence_masks, global_masks, attention_bias)
 
             assignments.append(assignment)
             detections.append(detection)
