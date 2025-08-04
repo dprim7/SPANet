@@ -461,8 +461,6 @@ class TestEndToEndMultiJetIntegration:
         assert torch.equal(combined_bias[:, ak5_size:ak5_size+ak8_size, ak5_size:ak5_size+ak8_size], ak8_overlap)
         assert torch.equal(combined_bias[:, ak5_size+ak8_size:, ak5_size+ak8_size:], ak15_overlap)
         
-        print("✓ Multi-jet attention bias integration works correctly")
-
     def test_mixed_legacy_and_multi_jet(self):
         """Test that system gracefully handles mix of legacy and new multi-jet bias."""
         batch_size = 2
