@@ -44,7 +44,7 @@ class CombinedVectorEmbedding(nn.Module):
             return RelativeVectorEmbedding
         elif embedding_type == InputType.Global:
             return GlobalVectorEmbedding
-        elif embedding_type == InputType.AttentionBiases:
+        elif embedding_type == InputType.AttentionBias:
             # Attention biases don't need traditional embedding - they're passed directly
             # Return a dummy identity embedding
             return lambda options, num_features: nn.Identity()
