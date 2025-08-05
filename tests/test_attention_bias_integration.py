@@ -26,7 +26,7 @@ class TestAttentionBiasIntegration:
             'normalized_features': lambda self, input_name: [False]  # No normalization for bias
         })()
         
-        # Create bias input instance
+        # Create bias input instance (skip HDF5 loading by providing data directly)
         bias_input = AttentionBiasInput(
             event_info=event_info,
             hdf5_file=None,
@@ -35,17 +35,15 @@ class TestAttentionBiasIntegration:
             limit_index=np.arange(4)
         )
         
-        # Manually set bias data for testing
-        batch_size, max_jets = 4, 6
-        bias_input.bias_data = torch.randn(batch_size, max_jets, max_jets)
-        bias_input.pairwise_mask = torch.ones(batch_size, max_jets, max_jets, dtype=torch.bool)
+        # Manually set the data since we're not loading from HDF5
+        bias_input.bias_data = torch.randn(4, 10, 10)  # [batch, seq, seq]
         
-        # Test source creation
+        # Test source creation after setting data
         source = bias_input[0]
         
         assert isinstance(source, Source)
         assert source.ak_overlap_mask is not None
-        assert source.ak_overlap_mask.shape == (max_jets, max_jets)
+        assert source.ak_overlap_mask.shape == (10, 10)  # Updated to match bias_data shape
         assert torch.equal(source.ak_overlap_mask, bias_input.bias_data[0])
     
     def test_network_attention_bias_extraction(self):

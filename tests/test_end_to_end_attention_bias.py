@@ -48,7 +48,7 @@ class TestEndToEndAttentionBiasFlow:
                         'phi': 'normalize'
                     }
                 },
-                'ATTENTION_BIASES': {
+                'ATTENTION_BIAS': {
                     'AKOverlap': {
                         'ak_overlap_scores': 'none'
                     }
@@ -79,7 +79,7 @@ class TestEndToEndAttentionBiasFlow:
                         'phi': 'normalize'
                     }
                 },
-                'ATTENTION_BIASES': {
+                'ATTENTION_BIAS': {
                     'MultiJetOverlap': {
                         'ak5_overlap': 'none',
                         'ak8_overlap': 'none',
@@ -188,7 +188,7 @@ class TestEndToEndAttentionBiasFlow:
         
         # Verify input types are correct
         assert event_info.input_type('Source') == InputType.Sequential
-        assert event_info.input_type('AKOverlap') == InputType.AttentionBiases
+        assert event_info.input_type('AKOverlap') == InputType.AttentionBias
         
         # Step 2: Load data using input factory
         with h5py.File(sample_hdf5_file_single_bias, 'r') as hdf5_file:
@@ -232,7 +232,7 @@ class TestEndToEndAttentionBiasFlow:
         
         # Verify input types are correct
         assert event_info.input_type('Source') == InputType.Sequential
-        assert event_info.input_type('MultiJetOverlap') == InputType.AttentionBiases
+        assert event_info.input_type('MultiJetOverlap') == InputType.AttentionBias
         
         # Step 2: Load data using input factory
         with h5py.File(sample_hdf5_file_multi_bias, 'r') as hdf5_file:
@@ -377,7 +377,7 @@ class TestAttentionBiasErrorHandling:
         config = {
             'INPUTS': {
                 'SEQUENTIAL': {'Source': {'pt': 'none'}},
-                'ATTENTION_BIASES': {'MissingBias': {'nonexistent_feature': 'none'}}
+                'ATTENTION_BIAS': {'MissingBias': {'nonexistent_feature': 'none'}}
             },
             'EVENT': {'t1': ['q1']},
             'PERMUTATIONS': {'EVENT': []},

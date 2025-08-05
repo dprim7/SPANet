@@ -131,7 +131,10 @@ class SpecialKey(str, Enum):
 class Source(NamedTuple):
     data: Tensor
     mask: Tensor
-    ak_overlap_mask: Optional[Tensor] = None  # Actually attention bias values, not mask  
+    ak_overlap_mask: Optional[Tensor] = None  # Actually attention bias values, not mask
+    ak5_overlap_mask: Optional[Tensor] = None  # AK5 jet overlap matrix
+    ak8_overlap_mask: Optional[Tensor] = None  # AK8 jet overlap matrix  
+    ak15_overlap_mask: Optional[Tensor] = None  # AK15 jet overlap matrix  
 
 class Statistics(NamedTuple):
     location: Tensor
@@ -143,7 +146,7 @@ class InputType(str, Enum):
     Relative = "RELATIVE"
     Sequential = "SEQUENTIAL"
     AttentionMasks = "ATTENTION_MASKS" 
-    AttentionBiases = "ATTENTION_BIASES" 
+    AttentionBias = "ATTENTION_BIAS" 
 
 
 class AssignmentTargets(NamedTuple):
