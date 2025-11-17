@@ -131,7 +131,7 @@ class SpecialKey(str, Enum):
 class Source(NamedTuple):
     data: Tensor
     mask: Tensor
-
+ 
 
 class Statistics(NamedTuple):
     location: Tensor
@@ -142,6 +142,7 @@ class InputType(str, Enum):
     Global = "GLOBAL"
     Relative = "RELATIVE"
     Sequential = "SEQUENTIAL"
+    AttentionBias = "ATTENTION_BIAS" 
 
 
 class AssignmentTargets(NamedTuple):

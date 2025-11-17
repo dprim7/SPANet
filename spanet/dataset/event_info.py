@@ -254,17 +254,51 @@ class EventInfo:
         for input_type in config[SpecialKey.Inputs]:
             current_inputs = with_default(config[SpecialKey.Inputs][input_type], default={})
 
-            for input_name, input_information in current_inputs.items():
-                input_types[input_name] = input_type.upper()
-                input_features[input_name] = tuple(
-                    FeatureInfo(
-                        name=name,
-                        normalize=("normalize" in normalize.lower()) or ("true" in normalize.lower()),
-                        log_scale="log" in normalize.lower()
-                    )
-
-                    for name, normalize in input_information.items()
+            # Special handling for ATTENTION_BIAS: can be both type and name
+            if input_type.upper() == "ATTENTION_BIAS":
+                # Check if this is the simple format: ATTENTION_BIAS: {feature: option}
+                # vs the complex format: ATTENTION_BIAS: {InputName: {feature: option}}
+                
+                # Look for direct feature definitions (not nested input names)
+                has_direct_features = any(
+                    isinstance(value, str) for value in current_inputs.values()
                 )
+                
+                if has_direct_features:
+                    # Simple format: ATTENTION_BIAS is both type and name
+                    input_types["ATTENTION_BIAS"] = input_type.upper()
+                    input_features["ATTENTION_BIAS"] = tuple(
+                        FeatureInfo(
+                            name=name,
+                            normalize=("normalize" in normalize.lower()) or ("true" in normalize.lower()),
+                            log_scale="log" in normalize.lower()
+                        )
+                        for name, normalize in current_inputs.items()
+                    )
+                else:
+                    # Complex format: ATTENTION_BIAS contains named inputs
+                    for input_name, input_information in current_inputs.items():
+                        input_types[input_name] = input_type.upper()
+                        input_features[input_name] = tuple(
+                            FeatureInfo(
+                                name=name,
+                                normalize=("normalize" in normalize.lower()) or ("true" in normalize.lower()),
+                                log_scale="log" in normalize.lower()
+                            )
+                            for name, normalize in input_information.items()
+                        )
+            else:
+                # Standard processing for other input types
+                for input_name, input_information in current_inputs.items():
+                    input_types[input_name] = input_type.upper()
+                    input_features[input_name] = tuple(
+                        FeatureInfo(
+                            name=name,
+                            normalize=("normalize" in normalize.lower()) or ("true" in normalize.lower()),
+                            log_scale="log" in normalize.lower()
+                        )
+                        for name, normalize in input_information.items()
+                    )
 
         # Extract event and permutation information.
         # ------------------------------------------

@@ -12,6 +12,7 @@ from spanet.network.layers.regression_decoder import RegressionDecoder
 from spanet.network.layers.classification_decoder import ClassificationDecoder
 
 from spanet.network.prediction_selection import extract_predictions
+from spanet.network.utilities.multi_jet_attention_bias import extract_multi_jet_attention_bias
 from spanet.network.jet_reconstruction.jet_reconstruction_base import JetReconstructionBase
 
 TArray = np.ndarray
@@ -82,6 +83,9 @@ class JetReconstructionNetwork(JetReconstructionBase):
         # Embed all of the different input regression_vectors into the same latent space.
         embeddings, padding_masks, sequence_masks, global_masks = self.embedding(sources)
 
+        # Extract attention bias data from multiple jet types if present in any source
+        attention_bias = extract_multi_jet_attention_bias(sources, self.event_info)
+
         # Extract features from data using transformer
         hidden, event_vector = self.encoder(embeddings, padding_masks, sequence_masks)
 
@@ -101,7 +105,7 @@ class JetReconstructionNetwork(JetReconstructionBase):
                 assignment_mask,
                 event_particle_vector,
                 product_particle_vectors
-            ) = decoder(hidden, padding_masks, sequence_masks, global_masks)
+            ) = decoder(hidden, padding_masks, sequence_masks, global_masks, attention_bias)
 
             assignments.append(assignment)
             detections.append(detection)

@@ -1,5 +1,5 @@
 from itertools import islice
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from opt_einsum import contract_expression
 
 import numpy as np
@@ -55,7 +55,11 @@ class SymmetricAttentionFull(SymmetricAttentionBase):
         nn.init.xavier_uniform_(self.weights)
 
     # noinspection PyUnusedLocal
-    def forward(self, x: Tensor, padding_mask: Tensor, sequence_mask: Tensor) -> Tensor:
+    def forward(
+            self, x: Tensor, 
+            padding_mask: Tensor, 
+            sequence_mask: Tensor,
+            attention_bias: Optional[Tensor] = None) -> Tensor:
         """ Perform symmetric attention on the hidden vectors and produce the output logits.
 
         This is the full version which creates the N^D tensor and perfoms a general linear form calculation.
@@ -68,6 +72,8 @@ class SymmetricAttentionFull(SymmetricAttentionBase):
             Negative mask indicating that a jet is padding for transformer.
         sequence_mask: [T, B, 1]
             Positive mask indicating jet is real.
+        attention_bias: Optional[Tensor]
+            Attention bias values to be added to pre-softmax attention scores.
 
         Returns
         -------
@@ -82,12 +88,15 @@ class SymmetricAttentionFull(SymmetricAttentionBase):
         symmetric_weights = symmetric_tensor(self.weights, self.no_identity_permutations)
         # symmetric_weights = symmetric_weights / self.weights_scale
 
-        # symmetric_weights = symmetric_weights ** (1 / self.order)
         # Perform the generalized matrix multiplication operation.
         # output: [B, T, T, ...] Symmetric output distribution
-        # output_operands = [x] * self.order + [symmetric_weights]
-        # output = self.output_operation(*output_operands, backend='torch')
         output = contract_linear_form(symmetric_weights, x)
+
+        # Apply attention bias AFTER tensor contraction but BEFORE symmetrization
+        if attention_bias is not None:
+            # attention_bias should have shape [B, T, T] for degree=2
+            # output should have shape [B, T, T] for degree=2
+            output = output + attention_bias
 
         output = symmetric_tensor(output, self.batch_no_identity_permutations)
 
