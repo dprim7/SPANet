@@ -55,6 +55,7 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         self.pairwise_source_name = ""
         self.kinematic_indices = None
         self._pt_is_log = False
+        self._pt_is_normalized = False
         self._eta_is_normalized = False
         self._phi_is_normalized = False
         self._mass_is_normalized = False
@@ -86,6 +87,7 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         mass_idx = kinematic_indices["mass_idx"]
         
         self._pt_is_log = bool(feature_infos[pt_idx].log_scale)
+        self._pt_is_normalized = bool(feature_infos[pt_idx].normalize)
         self._eta_is_normalized = bool(feature_infos[eta_idx].normalize)
         # Check if phi is normalized (only relevant if using direct phi, not sinphi/cosphi)
         if not kinematic_indices["use_sincos_phi"]:
@@ -124,8 +126,13 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Tensor]:
         idx = self.kinematic_indices
 
-        # Extract pt and undo log transform if applied
+        # Extract pt and recover the physical value. With `log_normalize` the
+        # dataset applies log(pt+1) FIRST and then z-scores, so the stored value
+        # is (log(pt+1) - mean) / std. We must undo the normalization BEFORE
+        # undoing the log. (eta/mass below are normalize-only, hence denorm only.)
         pt = source_data[:, :, idx["pt_idx"]]
+        if self._pt_is_normalized and self._denorm_mean is not None:
+            pt = pt * self._denorm_std[idx["pt_idx"]] + self._denorm_mean[idx["pt_idx"]]
         if self._pt_is_log:
             # Dataset transform is log(pt + 1). Recover pt.
             pt = torch.expm1(pt).clamp(min=0)
@@ -188,8 +195,8 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         source_data, source_mask = sources[self.pairwise_source_idx]
         pt, eta, phi, mass, mask = self._extract_kinematics(source_data, source_mask)
 
-        pairwise_features = self.pairwise_computer(pt, eta, phi, mass, mask)
-        pairwise_bias = self.pairwise_embedding(pairwise_features)
+        pairwise_features, pair_mask = self.pairwise_computer(pt, eta, phi, mass, mask)
+        pairwise_bias = self.pairwise_embedding(pairwise_features, pair_mask)
 
         total_seq_len = embeddings.shape[0]
         source_seq_len = source_data.shape[1]

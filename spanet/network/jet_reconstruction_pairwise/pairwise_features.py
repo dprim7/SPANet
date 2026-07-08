@@ -150,18 +150,66 @@ class PairwiseFeatureComputer(nn.Module):
         i = torch.arange(num_particles, device=pt.device)
         pairwise_features[:, i, i, :] = 0.0
 
+        # Valid-pair mask (True = real pair) so downstream normalization can ignore
+        # padded pairs. Self-pairs are excluded too (their features are zeroed above).
+        pair_mask = None
         if mask is not None:
-            pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1)
+            pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1)   # (B, N, N)
+            pair_mask = pair_mask.clone()
+            pair_mask[:, i, i] = False
             pairwise_features = pairwise_features * pair_mask.unsqueeze(-1)
 
-        return pairwise_features
+        return pairwise_features, pair_mask
+
+
+class MaskedBatchNorm1d(nn.Module):
+    """BatchNorm1d that computes statistics over valid (unmasked) positions only.
+
+    A standard BatchNorm1d over the flattened (B, C, N*N) pairwise tensor would
+    include padded pairs (which are zeroed), badly skewing the running mean/var --
+    for a low-multiplicity event most of the N*N matrix is padding. This variant
+    restricts the batch statistics to valid pairs, matching ParT's behaviour.
+    Falls back to standard behaviour when no mask is given.
+    """
+
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        # x: (B, C, L); mask: (B, 1, L) with 1.0 = valid, or None (all valid).
+        if self.training:
+            if mask is None:
+                mean = x.mean(dim=(0, 2))
+                var = x.var(dim=(0, 2), unbiased=False)
+            else:
+                n = mask.sum().clamp(min=1.0)
+                mean = (x * mask).sum(dim=(0, 2)) / n
+                centered = (x - mean[None, :, None]) * mask
+                var = (centered * centered).sum(dim=(0, 2)) / n
+            with torch.no_grad():
+                self.running_mean.mul_(1 - self.momentum).add_(self.momentum * mean.detach())
+                self.running_var.mul_(1 - self.momentum).add_(self.momentum * var.detach())
+        else:
+            mean = self.running_mean
+            var = self.running_var
+
+        x = (x - mean[None, :, None]) / torch.sqrt(var[None, :, None] + self.eps)
+        return x * self.weight[None, :, None] + self.bias[None, :, None]
 
 
 class PairwiseEmbedding(nn.Module):
     """Embed pairwise features into attention bias format (ParT-style).
 
     ParT uses BatchNorm + 1x1 Conv stacks to embed pairwise features into a
-    per-head attention bias. We implement the same idea here.
+    per-head attention bias. We implement the same idea here, but with
+    mask-aware BatchNorm so padded pairs do not corrupt the statistics.
     """
 
     def __init__(self, num_features: int, num_heads: int, embed_dim: int = 8):
@@ -169,25 +217,31 @@ class PairwiseEmbedding(nn.Module):
         self.num_heads = num_heads
         self.embed_dim = embed_dim
 
-        # Work on flattened pairs: (B, F, N*N). Use BN over feature channels like ParT.
-        self.input_bn = nn.BatchNorm1d(num_features)
-        self.embed = nn.Sequential(
-            nn.Conv1d(num_features, embed_dim, kernel_size=1),
-            nn.BatchNorm1d(embed_dim),
-            nn.GELU(),
-            nn.Conv1d(embed_dim, embed_dim, kernel_size=1),
-            nn.BatchNorm1d(embed_dim),
-            nn.GELU(),
-            nn.Conv1d(embed_dim, num_heads, kernel_size=1),
-        )
+        # Work on flattened pairs: (B, F, N*N). Masked BN over feature channels.
+        self.input_bn = MaskedBatchNorm1d(num_features)
+        self.conv1 = nn.Conv1d(num_features, embed_dim, kernel_size=1)
+        self.bn1 = MaskedBatchNorm1d(embed_dim)
+        self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
+        self.bn2 = MaskedBatchNorm1d(embed_dim)
+        self.conv3 = nn.Conv1d(embed_dim, num_heads, kernel_size=1)
+        self.act = nn.GELU()
 
-    def forward(self, pairwise_features: Tensor) -> Tensor:
+    def forward(self, pairwise_features: Tensor, pair_mask: Optional[Tensor] = None) -> Tensor:
         batch_size, seq_len, _, num_features = pairwise_features.shape
 
         # (B, N, N, F) -> (B, F, N*N)
         x = pairwise_features.permute(0, 3, 1, 2).contiguous().view(batch_size, num_features, seq_len * seq_len)
-        x = self.input_bn(x)
-        x = self.embed(x)  # (B, H, N*N)
+
+        mask = None
+        if pair_mask is not None:
+            # (B, N, N) -> (B, 1, N*N) float, 1.0 = valid pair
+            mask = pair_mask.reshape(batch_size, 1, seq_len * seq_len).to(x.dtype)
+
+        x = self.input_bn(x, mask)
+        x = self.act(self.bn1(self.conv1(x), mask))
+        x = self.act(self.bn2(self.conv2(x), mask))
+        x = self.conv3(x)  # (B, H, N*N)
+
         x = x.view(batch_size, self.num_heads, seq_len, seq_len)
         x = x.reshape(batch_size * self.num_heads, seq_len, seq_len)
         return x
