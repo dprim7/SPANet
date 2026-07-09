@@ -26,11 +26,36 @@ def delta_phi(phi1: Tensor, phi2: Tensor) -> Tensor:
     return dphi
 
 
+def _find_feature(
+    names: List[str],
+    exact: set,
+    suffixes: tuple,
+    exclude: set = frozenset(),
+) -> int:
+    """Find a kinematic feature by exact name first, then by '_'-prefixed suffix."""
+    for i, name in enumerate(names):
+        if i not in exclude and name in exact:
+            return i
+    for i, name in enumerate(names):
+        if i in exclude:
+            continue
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                return i
+    return -1
+
+
 def auto_detect_kinematic_features(
     feature_names: List[str],
     input_source: str = "",
 ) -> Dict:
-    """Auto-detect pt, eta, phi (or sinphi/cosphi), and mass indices."""
+    """Auto-detect pt, eta, phi (or sinphi/cosphi), and mass indices.
+
+    Matches either the bare kinematic name (``pt``) or any prefixed variant
+    (``fj_pt``, ``vfj_pt``, ...) so every jet collection is detected regardless
+    of its feature-name prefix. Softdrop mass (``*_sdmass``) is intentionally
+    NOT matched as mass -- only ``mass`` / ``*_mass`` (the full jet mass).
+    """
     feature_names_lower = [f.lower() for f in feature_names]
 
     result = {
@@ -43,35 +68,21 @@ def auto_detect_kinematic_features(
         "use_sincos_phi": False,
     }
 
-    for i, name in enumerate(feature_names_lower):
-        if name == "pt":
-            result["pt_idx"] = i
-            break
+    result["pt_idx"] = _find_feature(feature_names_lower, {"pt"}, ("_pt",))
+    result["eta_idx"] = _find_feature(feature_names_lower, {"eta"}, ("_eta",))
+    result["mass_idx"] = _find_feature(feature_names_lower, {"mass"}, ("_mass",))
 
-    for i, name in enumerate(feature_names_lower):
-        if name == "eta":
-            result["eta_idx"] = i
-            break
-
-    for i, name in enumerate(feature_names_lower):
-        if name == "phi":
-            result["phi_idx"] = i
-            break
-
-    if result["phi_idx"] == -1:
-        for i, name in enumerate(feature_names_lower):
-            if name in {"sinphi", "sin_phi"}:
-                result["sinphi_idx"] = i
-            elif name in {"cosphi", "cos_phi"}:
-                result["cosphi_idx"] = i
-
-        if result["sinphi_idx"] != -1 and result["cosphi_idx"] != -1:
-            result["use_sincos_phi"] = True
-
-    for i, name in enumerate(feature_names_lower):
-        if name == "mass":
-            result["mass_idx"] = i
-            break
+    result["sinphi_idx"] = _find_feature(feature_names_lower, {"sinphi", "sin_phi"}, ("_sinphi",))
+    result["cosphi_idx"] = _find_feature(feature_names_lower, {"cosphi", "cos_phi"}, ("_cosphi",))
+    if result["sinphi_idx"] != -1 and result["cosphi_idx"] != -1:
+        result["use_sincos_phi"] = True
+    else:
+        # Fall back to a direct phi feature; exclude any lone sin/cos hit so a
+        # name like `sin_phi` is never mistaken for phi via the `_phi` suffix.
+        exclude = {i for i in (result["sinphi_idx"], result["cosphi_idx"]) if i != -1}
+        result["sinphi_idx"] = -1
+        result["cosphi_idx"] = -1
+        result["phi_idx"] = _find_feature(feature_names_lower, {"phi"}, ("_phi",), exclude)
 
     if result["pt_idx"] == -1:
         raise ValueError(f"Could not find 'pt' feature in {input_source}: {feature_names}")
@@ -83,6 +94,60 @@ def auto_detect_kinematic_features(
         )
 
     return result
+
+
+def combine_collection_kinematics(
+    segments: List,
+) -> "tuple":
+    """Assemble per-collection physical kinematics into one combined sequence.
+
+    ``segments`` is an ordered list matching the embedding concatenation order.
+    Each element is ``(length, kin)`` where ``kin`` is either ``None`` (a
+    segment that does not participate in pairwise features -- its positions
+    are masked out) or a tuple ``(pt, eta, phi, mass_or_None, mask)`` of
+    ``(B, length)`` tensors already converted to PHYSICAL units.
+
+    Returns ``(pt, eta, phi, mass, mask)`` of shape ``(B, N_total)``.
+
+    Rationale: each collection is normalized with its OWN statistics (and pt is
+    log-transformed), so a normalized value from `Jets` and one from
+    `BoostedJets` are not comparable. Cross-collection pairwise features
+    (deltaR, m2, kt, z) are only physically meaningful after every collection
+    has been denormalized back to a common physical scale (GeV / radians).
+    Callers must therefore denormalize BEFORE combining -- this function only
+    aligns and concatenates.
+    """
+    reference = None
+    for _, kin in segments:
+        if kin is not None:
+            reference = kin[0]
+            break
+    if reference is None:
+        raise ValueError("combine_collection_kinematics: no participating segments")
+
+    batch_size = reference.shape[0]
+    total = sum(length for length, _ in segments)
+    device, dtype = reference.device, reference.dtype
+
+    pt = torch.zeros(batch_size, total, device=device, dtype=dtype)
+    eta = torch.zeros(batch_size, total, device=device, dtype=dtype)
+    phi = torch.zeros(batch_size, total, device=device, dtype=dtype)
+    mass = torch.zeros(batch_size, total, device=device, dtype=dtype)
+    mask = torch.zeros(batch_size, total, device=device, dtype=torch.bool)
+
+    offset = 0
+    for length, kin in segments:
+        if kin is not None:
+            seg_pt, seg_eta, seg_phi, seg_mass, seg_mask = kin
+            pt[:, offset:offset + length] = seg_pt
+            eta[:, offset:offset + length] = seg_eta
+            phi[:, offset:offset + length] = seg_phi
+            if seg_mass is not None:
+                mass[:, offset:offset + length] = seg_mass
+            mask[:, offset:offset + length] = seg_mask
+        offset += length
+
+    return pt, eta, phi, mass, mask
 
 
 class PairwiseFeatureComputer(nn.Module):
@@ -243,5 +308,11 @@ class PairwiseEmbedding(nn.Module):
         x = self.conv3(x)  # (B, H, N*N)
 
         x = x.view(batch_size, self.num_heads, seq_len, seq_len)
+        if pair_mask is not None:
+            # Zero the bias on invalid pairs (padding, self-pairs, and any
+            # positions outside the participating collections). The conv stack
+            # has bias terms, so without this the invalid entries would carry a
+            # nonzero constant into the attention scores.
+            x = x * pair_mask.unsqueeze(1).to(x.dtype)
         x = x.reshape(batch_size * self.num_heads, seq_len, seq_len)
         return x

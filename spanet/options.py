@@ -140,8 +140,9 @@ class Options(Namespace):
         # Pairwise Interaction Options (Particle Transformer-style)
         # =========================================================================================
 
-        # Enable pairwise interaction features in attention mechanism.
-        # When True, uses JetReconstructionModelWithPairwise instead of JetReconstructionModel.
+        # Enable pairwise interaction features in the attention mechanism.
+        # When True, JetReconstructionModel swaps in the pairwise-aware
+        # embedding and encoder (ParT-style additive attention bias).
         self.use_pairwise_interactions: bool = False
 
         # Number of pairwise features to compute between particle pairs.
@@ -151,8 +152,12 @@ class Options(Namespace):
         # Hidden dimension for pairwise feature embedding MLP.
         self.pairwise_embedding_dim: int = 8
 
-        # Which SEQUENTIAL input source to use for pairwise features.
-        # Empty string means auto-detect the first SEQUENTIAL input.
+        # Which SEQUENTIAL input sources participate in pairwise features.
+        # "" or "all" (default): ALL sequential collections -- one unified
+        # N_total x N_total bias over the full concatenated sequence, covering
+        # intra- AND cross-collection pairs (each collection is denormalized
+        # with its own statistics to physical units before combining).
+        # A single name (e.g. "Jets") or a list of names restricts it.
         self.pairwise_input_source: str = ""
 
         # =========================================================================================
