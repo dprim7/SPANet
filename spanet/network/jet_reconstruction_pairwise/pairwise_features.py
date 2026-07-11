@@ -151,40 +151,63 @@ def combine_collection_kinematics(
 
 
 class PairwiseFeatureComputer(nn.Module):
-    """Compute Particle Transformer-style pairwise interaction features."""
+    """Compute Particle Transformer-style pairwise interaction features.
+
+    Supports both same-type blocks (a collection with itself: square, diagonal
+    removed) and cross-type blocks (two different collections: rectangular),
+    via :meth:`compute_block`. The classic single-set :meth:`forward` is kept
+    for the unified (shared-MLP) path and existing tests.
+    """
 
     def __init__(self, num_features: int = 4, eps: float = 1e-7):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
 
-    def forward(
-        self,
-        pt: Tensor,
-        eta: Tensor,
-        phi: Tensor,
-        mass: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
-    ) -> Tensor:
-        batch_size, num_particles = pt.shape
-
-        if mass is None:
-            mass = torch.zeros_like(pt)
-
-        # Following ParT: use ln(kt), ln(z), ln(delta), ln(m^2) constructed from kinematics.
-        # Here we approximate rapidity with pseudorapidity (eta), which is reasonable for ultra-relativistic jets.
+    @staticmethod
+    def _four_vector(pt: Tensor, eta: Tensor, phi: Tensor, mass: Tensor, eps: float):
         px = pt * torch.cos(phi)
         py = pt * torch.sin(phi)
         pz = pt * torch.sinh(eta)
-        energy = torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2 + self.eps)
+        energy = torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2 + eps)
+        return px, py, pz, energy
 
-        pt_i, pt_j = pt.unsqueeze(2), pt.unsqueeze(1)
-        eta_i, eta_j = eta.unsqueeze(2), eta.unsqueeze(1)
-        phi_i, phi_j = phi.unsqueeze(2), phi.unsqueeze(1)
-        px_i, px_j = px.unsqueeze(2), px.unsqueeze(1)
-        py_i, py_j = py.unsqueeze(2), py.unsqueeze(1)
-        pz_i, pz_j = pz.unsqueeze(2), pz.unsqueeze(1)
-        e_i, e_j = energy.unsqueeze(2), energy.unsqueeze(1)
+    def compute_block(
+        self,
+        kin_i,
+        kin_j,
+        mask_i: Optional[Tensor] = None,
+        mask_j: Optional[Tensor] = None,
+        remove_self_pair: bool = False,
+    ):
+        """Features between set i (rows) and set j (columns).
+
+        ``kin_*`` are ``(pt, eta, phi, mass_or_None)`` tuples of ``(B, N)``
+        tensors in PHYSICAL units. Returns ``(features, pair_mask)`` with
+        shapes ``(B, Ni, Nj, F)`` / ``(B, Ni, Nj)``; ``pair_mask`` is None if
+        both masks are None. Padded pairs (and the diagonal, when
+        ``remove_self_pair``) are zeroed in features and False in the mask.
+        """
+        pt_i, eta_i, phi_i, mass_i = kin_i
+        pt_j, eta_j, phi_j, mass_j = kin_j
+        if mass_i is None:
+            mass_i = torch.zeros_like(pt_i)
+        if mass_j is None:
+            mass_j = torch.zeros_like(pt_j)
+
+        # Following ParT: ln(kt), ln(z), ln(deltaR), ln(m^2) from kinematics.
+        # Rapidity is approximated with pseudorapidity (eta).
+        px_i, py_i, pz_i, e_i = self._four_vector(pt_i, eta_i, phi_i, mass_i, self.eps)
+        px_j, py_j, pz_j, e_j = self._four_vector(pt_j, eta_j, phi_j, mass_j, self.eps)
+
+        # Broadcast rows (i, dim 2) against columns (j, dim 1) -> (B, Ni, Nj).
+        pt_i, pt_j = pt_i.unsqueeze(2), pt_j.unsqueeze(1)
+        eta_i, eta_j = eta_i.unsqueeze(2), eta_j.unsqueeze(1)
+        phi_i, phi_j = phi_i.unsqueeze(2), phi_j.unsqueeze(1)
+        px_i, px_j = px_i.unsqueeze(2), px_j.unsqueeze(1)
+        py_i, py_j = py_i.unsqueeze(2), py_j.unsqueeze(1)
+        pz_i, pz_j = pz_i.unsqueeze(2), pz_j.unsqueeze(1)
+        e_i, e_j = e_i.unsqueeze(2), e_j.unsqueeze(1)
 
         features = []
 
@@ -210,21 +233,39 @@ class PairwiseFeatureComputer(nn.Module):
 
         pairwise_features = torch.stack(features, dim=-1)
 
-        # Neutralize self-pairs (i == j), like ParT's optional remove_self_pair.
-        # This avoids injecting large negative logs on the diagonal from delta_r ~ sqrt(eps).
-        i = torch.arange(num_particles, device=pt.device)
-        pairwise_features[:, i, i, :] = 0.0
+        square = pairwise_features.shape[1] == pairwise_features.shape[2]
+        diag = None
+        if remove_self_pair and square:
+            # Neutralize self-pairs (i == j), like ParT's remove_self_pair.
+            # Avoids large negative logs on the diagonal from delta_r ~ sqrt(eps).
+            diag = torch.arange(pairwise_features.shape[1], device=pairwise_features.device)
+            pairwise_features = pairwise_features.clone()
+            pairwise_features[:, diag, diag, :] = 0.0
 
-        # Valid-pair mask (True = real pair) so downstream normalization can ignore
-        # padded pairs. Self-pairs are excluded too (their features are zeroed above).
+        # Valid-pair mask (True = real pair) so downstream normalization can
+        # ignore padded pairs; the removed diagonal is excluded too.
         pair_mask = None
-        if mask is not None:
-            pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1)   # (B, N, N)
+        if mask_i is not None and mask_j is not None:
+            pair_mask = mask_i.unsqueeze(2) & mask_j.unsqueeze(1)
             pair_mask = pair_mask.clone()
-            pair_mask[:, i, i] = False
+            if diag is not None:
+                pair_mask[:, diag, diag] = False
             pairwise_features = pairwise_features * pair_mask.unsqueeze(-1)
 
         return pairwise_features, pair_mask
+
+    def forward(
+        self,
+        pt: Tensor,
+        eta: Tensor,
+        phi: Tensor,
+        mass: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Single-set (unified) path: all-vs-all with the diagonal removed."""
+        return self.compute_block(
+            (pt, eta, phi, mass), (pt, eta, phi, mass), mask, mask, remove_self_pair=True
+        )
 
 
 class MaskedBatchNorm1d(nn.Module):
@@ -292,27 +333,28 @@ class PairwiseEmbedding(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, pairwise_features: Tensor, pair_mask: Optional[Tensor] = None) -> Tensor:
-        batch_size, seq_len, _, num_features = pairwise_features.shape
+        # Blocks may be rectangular (rows != cols) for cross-type collections.
+        batch_size, num_rows, num_cols, num_features = pairwise_features.shape
 
-        # (B, N, N, F) -> (B, F, N*N)
-        x = pairwise_features.permute(0, 3, 1, 2).contiguous().view(batch_size, num_features, seq_len * seq_len)
+        # (B, R, C, F) -> (B, F, R*C)
+        x = pairwise_features.permute(0, 3, 1, 2).contiguous().view(batch_size, num_features, num_rows * num_cols)
 
         mask = None
         if pair_mask is not None:
-            # (B, N, N) -> (B, 1, N*N) float, 1.0 = valid pair
-            mask = pair_mask.reshape(batch_size, 1, seq_len * seq_len).to(x.dtype)
+            # (B, R, C) -> (B, 1, R*C) float, 1.0 = valid pair
+            mask = pair_mask.reshape(batch_size, 1, num_rows * num_cols).to(x.dtype)
 
         x = self.input_bn(x, mask)
         x = self.act(self.bn1(self.conv1(x), mask))
         x = self.act(self.bn2(self.conv2(x), mask))
-        x = self.conv3(x)  # (B, H, N*N)
+        x = self.conv3(x)  # (B, H, R*C)
 
-        x = x.view(batch_size, self.num_heads, seq_len, seq_len)
+        x = x.view(batch_size, self.num_heads, num_rows, num_cols)
         if pair_mask is not None:
             # Zero the bias on invalid pairs (padding, self-pairs, and any
             # positions outside the participating collections). The conv stack
             # has bias terms, so without this the invalid entries would carry a
             # nonzero constant into the attention scores.
             x = x * pair_mask.unsqueeze(1).to(x.dtype)
-        x = x.reshape(batch_size * self.num_heads, seq_len, seq_len)
+        x = x.reshape(batch_size * self.num_heads, num_rows, num_cols)
         return x

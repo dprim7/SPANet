@@ -160,6 +160,21 @@ class Options(Namespace):
         # A single name (e.g. "Jets") or a list of names restricts it.
         self.pairwise_input_source: str = ""
 
+        # Use an independent embedding MLP (each with its own masked BatchNorm)
+        # per pair-type block: one per collection (Jets-Jets, Boosted-Boosted)
+        # and one per resonance-coupled collection pair (Jets-Boosted).
+        # Different pair populations have very different kinematic
+        # distributions; per-block normalization treats each on its own terms
+        # instead of pooling them through one shared MLP. False (default)
+        # keeps the single shared MLP over all pairs.
+        self.pairwise_block_embeddings: bool = False
+
+        # In block mode, build cross-type blocks only for collection pairs
+        # coupled by a resonance in the event file (e.g. SRqqt = b:Jets +
+        # qq:BoostedJets couples Jets and BoostedJets). False: same-type
+        # blocks only.
+        self.pairwise_cross_type: bool = True
+
         # =========================================================================================
         # Mixture of Experts (MoE) Options
         # =========================================================================================
