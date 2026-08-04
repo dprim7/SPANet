@@ -35,7 +35,9 @@ def test_rectangular_cross_block_physics():
     assert pmask.shape == (1, 2, 1) and pmask.all()
 
     d_eta = 0.0 - (-1.0)
-    d_phi = math.fmod(0.0 - 2.0 + math.pi, 2 * math.pi) - math.pi
+    # %-based wrap follows the divisor sign (correct for dphi < -pi);
+    # math.fmod would reproduce the pre-fix delta_phi bug.
+    d_phi = (0.0 - 2.0 + math.pi) % (2 * math.pi) - math.pi
     dr = math.sqrt(d_eta ** 2 + d_phi ** 2)
     assert abs(feats[0, 0, 0, 2].item() - math.log(dr)) < 1e-3   # ln(deltaR)
     kt = min(100.0, 300.0) * dr

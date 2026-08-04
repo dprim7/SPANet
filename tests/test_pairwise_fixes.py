@@ -17,7 +17,33 @@ from spanet.network.jet_reconstruction_pairwise.pairwise_features import (
     MaskedBatchNorm1d,
     PairwiseFeatureComputer,
     PairwiseEmbedding,
+    delta_phi,
 )
+
+
+def test_delta_phi_wraps_below_minus_pi():
+    """delta_phi must wrap into [-pi, pi) on BOTH sides.
+
+    The old torch.fmod version kept the dividend's sign: for dphi < -pi the
+    shifted value was negative and came back unwrapped (|dphi| in (pi, 2pi)).
+    """
+    # Failing branch: phi1=-3, phi2=3 -> raw dphi = -6 -> wrapped ~ +0.2832.
+    d = delta_phi(torch.tensor([-3.0]), torch.tensor([3.0]))
+    expected = -6.0 + 2 * math.pi
+    assert abs(d.item() - expected) < 1e-6, d.item()
+
+    # Mirrored control (this branch worked even with fmod): +6 -> 6 - 2pi.
+    d = delta_phi(torch.tensor([3.0]), torch.tensor([-3.0]))
+    assert abs(d.item() - (6.0 - 2 * math.pi)) < 1e-6, d.item()
+
+    # Property sweep against the %-based reference over a phi grid.
+    grid = torch.linspace(-math.pi, math.pi, 41)
+    p1, p2 = torch.meshgrid(grid, grid, indexing="ij")
+    d = delta_phi(p1, p2)
+    assert (d.abs() <= math.pi + 1e-6).all(), d.abs().max()
+    ref = (p1 - p2 + math.pi) % (2 * math.pi) - math.pi
+    assert torch.allclose(d, ref, atol=1e-6)
+    print("OK delta_phi wraps below -pi")
 
 
 def test_fix1_pt_denormalization_math():
@@ -152,6 +178,7 @@ def test_fix2_neg_inf_masks_padding_in_attention():
 
 
 if __name__ == "__main__":
+    test_delta_phi_wraps_below_minus_pi()
     test_fix1_pt_denormalization_math()
     test_fix2_neg_inf_masks_padding_in_attention()
     test_fix3_masked_batchnorm_ignores_padding()

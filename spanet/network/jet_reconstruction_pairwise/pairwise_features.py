@@ -20,9 +20,15 @@ def sincos_to_phi(sinphi: Tensor, cosphi: Tensor) -> Tensor:
 
 
 def delta_phi(phi1: Tensor, phi2: Tensor) -> Tensor:
-    """Compute delta phi with proper wrapping to [-pi, pi]."""
+    """Compute delta phi with proper wrapping to [-pi, pi).
+
+    torch.remainder (NOT fmod): fmod keeps the dividend's sign, so for
+    dphi < -pi the shifted value is negative and comes back unwrapped --
+    |delta phi| in (pi, 2pi) on ~1/8 of uniform-phi pairs. remainder follows
+    the divisor's sign, mapping into [0, 2pi) before the -pi shift.
+    """
     dphi = phi1 - phi2
-    dphi = torch.fmod(dphi + math.pi, 2 * math.pi) - math.pi
+    dphi = torch.remainder(dphi + math.pi, 2 * math.pi) - math.pi
     return dphi
 
 
