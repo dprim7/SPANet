@@ -13,14 +13,17 @@ Design rationale (multi-collection pairwise):
     which matter physically (e.g. a semi-resolved top is a small-R b-jet paired
     with a boosted W fatjet).
 
-    The enabling prerequisite is denormalization: each collection is z-scored
-    with its OWN statistics (and pt is log-transformed), so normalized values
-    from different collections are not comparable. Every collection is
-    therefore denormalized back to physical units (GeV / radians) with its own
-    statistics BEFORE pair features are computed; only then are
-    cross-collection deltaR / m^2 meaningful. Kinematics are laid out in the
-    SAME order the embeddings are stacked so that bias position k refers to
-    the same jet as attention position k (guarded at runtime).
+    The enabling prerequisite is recovery to physical units: the raw
+    ``sources`` tensors carry log1p-transformed values for ``log_scale``
+    features (``SequentialInput.load`` applies ``log(x+1)`` at load; z-scoring
+    happens ONLY later, out-of-place, inside ``CombinedVectorEmbedding`` via
+    ``Normalizer`` and never mutates ``sources``). Each collection is
+    therefore recovered to physical units (GeV / radians) by undoing exactly
+    the log transform -- no mean/std is involved -- BEFORE pair features are
+    computed; only then are cross-collection deltaR / m^2 meaningful.
+    Kinematics are laid out in the SAME order the embeddings are stacked so
+    that bias position k refers to the same jet as attention position k
+    (guarded at runtime).
 
 Two embedding structures are available (options.pairwise_block_embeddings):
     * unified (False): one shared MLP + masked BatchNorm over ALL pairs.
@@ -49,7 +52,7 @@ from .pairwise_features import (
     PairwiseEmbedding,
     auto_detect_kinematic_features,
     combine_collection_kinematics,
-    sincos_to_phi,
+    extract_physical_kinematics,
 )
 
 
@@ -108,32 +111,14 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
                 "input_index": idx,
                 "name": input_name,
                 "kin": kin,
+                # The raw sources tensors are log1p-transformed at load for
+                # log_scale features and NEVER z-scored (Normalizer runs
+                # out-of-place downstream) -- recovery needs only these flags.
                 "pt_is_log": bool(feature_infos[kin["pt_idx"]].log_scale),
-                "pt_is_normalized": bool(feature_infos[kin["pt_idx"]].normalize),
-                "eta_is_normalized": bool(feature_infos[kin["eta_idx"]].normalize),
-                # sinphi/cosphi are typically not normalized (they're in [-1, 1]).
-                "phi_is_normalized": (
-                    bool(feature_infos[kin["phi_idx"]].normalize)
-                    if (not kin["use_sincos_phi"] and kin["phi_idx"] >= 0)
-                    else False
-                ),
-                "mass_is_normalized": bool(
-                    kin["mass_idx"] >= 0 and feature_infos[kin["mass_idx"]].normalize
+                "mass_is_log": bool(
+                    kin["mass_idx"] >= 0 and feature_infos[kin["mass_idx"]].log_scale
                 ),
             }
-
-            # Per-collection normalization statistics for denormalizing back to
-            # physical units. Each collection MUST be denormalized with its own
-            # stats before cross-collection features are computed.
-            if options.normalize_features:
-                if training_dataset.mean is None:
-                    training_dataset.compute_source_statistics()
-                self.register_buffer(
-                    f"_pw_mean_{idx}", training_dataset.mean[input_name].clone().float()
-                )
-                self.register_buffer(
-                    f"_pw_std_{idx}", training_dataset.std[input_name].clone().float()
-                )
 
             self.pairwise_collections.append(info)
 
@@ -190,42 +175,13 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Tensor]:
         """Recover PHYSICAL (pt, eta, phi, mass) for one collection.
 
-        Uses this collection's own normalization statistics. With
-        `log_normalize` the dataset applies log(pt+1) FIRST and then z-scores,
-        so the stored value is (log(pt+1) - mean) / std: we must undo the
-        normalization BEFORE undoing the log.
+        Thin wrapper over :func:`extract_physical_kinematics` -- the raw
+        ``sources`` tensors are log1p-transformed only (never z-scored), so
+        recovery is expm1 for log_scale features and identity otherwise.
         """
-        idx = info["kin"]
-        mean = getattr(self, f"_pw_mean_{info['input_index']}", None)
-        std = getattr(self, f"_pw_std_{info['input_index']}", None)
-
-        pt = source_data[:, :, idx["pt_idx"]]
-        if info["pt_is_normalized"] and mean is not None:
-            pt = pt * std[idx["pt_idx"]] + mean[idx["pt_idx"]]
-        if info["pt_is_log"]:
-            # Dataset transform is log(pt + 1). Recover pt.
-            pt = torch.expm1(pt).clamp(min=0)
-
-        eta = source_data[:, :, idx["eta_idx"]]
-        if info["eta_is_normalized"] and mean is not None:
-            eta = eta * std[idx["eta_idx"]] + mean[idx["eta_idx"]]
-
-        if idx["use_sincos_phi"]:
-            sinphi = source_data[:, :, idx["sinphi_idx"]]
-            cosphi = source_data[:, :, idx["cosphi_idx"]]
-            phi = sincos_to_phi(sinphi, cosphi)
-        else:
-            phi = source_data[:, :, idx["phi_idx"]]
-            if info["phi_is_normalized"] and mean is not None:
-                phi = phi * std[idx["phi_idx"]] + mean[idx["phi_idx"]]
-
-        mass = None
-        if idx["mass_idx"] >= 0:
-            mass = source_data[:, :, idx["mass_idx"]]
-            if info["mass_is_normalized"] and mean is not None:
-                mass = mass * std[idx["mass_idx"]] + mean[idx["mass_idx"]]
-                mass = mass.clamp(min=0)
-
+        pt, eta, phi, mass = extract_physical_kinematics(
+            source_data, info["kin"], info["pt_is_log"], info["mass_is_log"]
+        )
         return pt, eta, phi, mass, source_mask
 
     def forward(

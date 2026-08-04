@@ -1,9 +1,10 @@
 """Regression tests for the pairwise-attention fixes.
 
-Covers three bugs in the on-the-fly ParT-style pairwise implementation:
-  1. pt not denormalized before undoing the log (log_normalize is log + z-score).
+Covers bugs in the on-the-fly ParT-style pairwise implementation:
+  1. kinematic recovery must match the LOAD pipeline (log1p only, no z-score).
   2. padding masked with +1.0 instead of -inf (padded jets leaked into attention).
   3. BatchNorm computed over zeroed padded pairs, skewing the statistics.
+  4. delta_phi must wrap on both sides (fmod kept the dividend sign).
 
 These only need torch + spanet.network.jet_reconstruction_pairwise.pairwise_features
 (which has no heavy deps), so they run without a dataset or Options.
@@ -18,6 +19,7 @@ from spanet.network.jet_reconstruction_pairwise.pairwise_features import (
     PairwiseFeatureComputer,
     PairwiseEmbedding,
     delta_phi,
+    extract_physical_kinematics,
 )
 
 
@@ -46,26 +48,64 @@ def test_delta_phi_wraps_below_minus_pi():
     print("OK delta_phi wraps below -pi")
 
 
-def test_fix1_pt_denormalization_math():
-    """The recovery must undo z-score BEFORE undoing the log.
+def test_kinematic_recovery_matches_dataset_pipeline():
+    """extract_physical_kinematics must invert the LOAD-time transform exactly.
 
-    Reproduces the dataset transform for `log_normalize`:
-        stored = (log(pt + 1) - mean) / std
-    and checks that denorm-then-expm1 recovers physical pt, while the old
-    expm1-only path does not.
+    The dataset pipeline (SequentialInput.load) applies ONLY log(x+1) to
+    log_scale features at load; z-scoring happens later, out-of-place, inside
+    CombinedVectorEmbedding via Normalizer and never mutates the raw sources.
+    So stored = log1p(pt) -- NOT (log1p(pt) - mean)/std. This test builds
+    source_data exactly as the loader does and asserts exact physical
+    recovery; an earlier revision applied x*std+mean here (mis-modeling the
+    pipeline) and its test was vacuous (it tested its own assumption without
+    calling production code).
     """
     torch.manual_seed(0)
-    pt = torch.rand(3, 6) * 500.0  # physical pt in [0, 500]
-    logged = torch.log1p(pt)
-    mean, std = logged.mean(), logged.std()
-    stored = (logged - mean) / std
+    B, N = 3, 6
+    pt_phys = torch.rand(B, N) * 1980.0 + 20.0   # 20..2000 GeV
+    eta_phys = torch.randn(B, N)
+    phi_phys = torch.rand(B, N) * 2 * math.pi - math.pi
+    mass_phys = torch.rand(B, N) * 150.0
 
-    recovered = torch.expm1(stored * std + mean).clamp(min=0)  # correct (fix #1)
-    assert torch.allclose(recovered, pt, atol=1e-3), (recovered - pt).abs().max()
+    # Build source_data exactly as SequentialInput.load does: log1p for
+    # log_scale features, raw otherwise, NO z-score.
+    cols = {
+        "pt": torch.log1p(pt_phys),        # pt: log_normalize -> log1p stored
+        "eta": eta_phys,                   # eta: normalize -> raw stored
+        "sinphi": torch.sin(phi_phys),
+        "cosphi": torch.cos(phi_phys),
+        "mass": mass_phys,                 # v11 mass: normalize -> raw stored
+    }
+    source_data = torch.stack(list(cols.values()), dim=-1)
+    kin = {
+        "pt_idx": 0, "eta_idx": 1, "sinphi_idx": 2, "cosphi_idx": 3,
+        "phi_idx": -1, "mass_idx": 4, "use_sincos_phi": True,
+    }
 
-    wrong = torch.expm1(stored).clamp(min=0)  # old behaviour (expm1 only)
-    assert not torch.allclose(wrong, pt, atol=1.0)
-    print("OK fix#1 pt denormalization")
+    pt, eta, phi, mass = extract_physical_kinematics(
+        source_data, kin, pt_is_log=True, mass_is_log=False
+    )
+    assert torch.allclose(pt, pt_phys, atol=1e-3), (pt - pt_phys).abs().max()
+    assert torch.allclose(eta, eta_phys, atol=1e-6)
+    assert torch.allclose(phi, phi_phys, atol=1e-5)
+    assert torch.allclose(mass, mass_phys, atol=1e-6)
+
+    # log-scaled mass variant (e.g. upstream ttbar event files).
+    source_log_mass = source_data.clone()
+    source_log_mass[:, :, 4] = torch.log1p(mass_phys)
+    _, _, _, mass2 = extract_physical_kinematics(
+        source_log_mass, kin, pt_is_log=True, mass_is_log=True
+    )
+    assert torch.allclose(mass2, mass_phys, atol=1e-3)
+
+    # Control: the old recipe (x*std + mean before expm1, with stats of the
+    # log1p'd values) does NOT recover physical pt from load-pipeline tensors.
+    stored_pt = cols["pt"]
+    mean, std = stored_pt.mean(), stored_pt.std()
+    old_recipe = torch.expm1(stored_pt * std + mean).clamp(min=0)
+    assert not torch.allclose(old_recipe, pt_phys, rtol=0.1), \
+        "old x*std+mean recipe unexpectedly recovered physical pt"
+    print("OK kinematic recovery matches dataset pipeline")
 
 
 def test_fix3_masked_batchnorm_ignores_padding():
@@ -179,7 +219,7 @@ def test_fix2_neg_inf_masks_padding_in_attention():
 
 if __name__ == "__main__":
     test_delta_phi_wraps_below_minus_pi()
-    test_fix1_pt_denormalization_math()
+    test_kinematic_recovery_matches_dataset_pipeline()
     test_fix2_neg_inf_masks_padding_in_attention()
     test_fix3_masked_batchnorm_ignores_padding()
     test_fix3_embedding_padded_pairs_do_not_affect_valid_bias()

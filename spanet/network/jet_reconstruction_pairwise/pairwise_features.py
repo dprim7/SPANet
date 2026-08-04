@@ -102,6 +102,52 @@ def auto_detect_kinematic_features(
     return result
 
 
+def extract_physical_kinematics(
+    source_data: Tensor,
+    kin: dict,
+    pt_is_log: bool,
+    mass_is_log: bool,
+):
+    """Recover PHYSICAL (pt, eta, phi, mass_or_None) from a raw source tensor.
+
+    The dataset pipeline applies ONLY the log transform at load time
+    (``SequentialInput.load``: ``log(x + 1)`` for ``log_scale`` features);
+    z-scoring happens later, out-of-place, inside ``CombinedVectorEmbedding``
+    via ``Normalizer`` and never touches the raw ``sources`` tensors this
+    function receives. Recovery is therefore:
+
+        pt   = expm1(x)  if the pt feature has log_scale, else x
+        eta  = x
+        phi  = atan2(sinphi, cosphi)  (or raw phi column)
+        mass = expm1(x)  if the mass feature has log_scale, else x
+
+    No mean/std enters anywhere -- applying ``x*std + mean`` here (as an
+    earlier revision did) un-z-scores data that was never z-scored and
+    nonlinearly distorts every downstream pairwise feature.
+    """
+    pt = source_data[:, :, kin["pt_idx"]]
+    if pt_is_log:
+        pt = torch.expm1(pt).clamp(min=0)
+
+    eta = source_data[:, :, kin["eta_idx"]]
+
+    if kin["use_sincos_phi"]:
+        phi = sincos_to_phi(
+            source_data[:, :, kin["sinphi_idx"]],
+            source_data[:, :, kin["cosphi_idx"]],
+        )
+    else:
+        phi = source_data[:, :, kin["phi_idx"]]
+
+    mass = None
+    if kin["mass_idx"] >= 0:
+        mass = source_data[:, :, kin["mass_idx"]]
+        if mass_is_log:
+            mass = torch.expm1(mass).clamp(min=0)
+
+    return pt, eta, phi, mass
+
+
 def combine_collection_kinematics(
     segments: List,
 ) -> "tuple":
@@ -115,13 +161,14 @@ def combine_collection_kinematics(
 
     Returns ``(pt, eta, phi, mass, mask)`` of shape ``(B, N_total)``.
 
-    Rationale: each collection is normalized with its OWN statistics (and pt is
-    log-transformed), so a normalized value from `Jets` and one from
-    `BoostedJets` are not comparable. Cross-collection pairwise features
+    Rationale: raw source tensors carry log1p-transformed values for
+    ``log_scale`` features (z-scoring happens only downstream inside
+    ``CombinedVectorEmbedding`` on separate tensors), so collections are on
+    mixed scales until recovered. Cross-collection pairwise features
     (deltaR, m2, kt, z) are only physically meaningful after every collection
-    has been denormalized back to a common physical scale (GeV / radians).
-    Callers must therefore denormalize BEFORE combining -- this function only
-    aligns and concatenates.
+    is recovered to a common physical scale (GeV / radians) via
+    ``extract_physical_kinematics``. This function only aligns and
+    concatenates.
     """
     reference = None
     for _, kin in segments:
