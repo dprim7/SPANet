@@ -137,6 +137,7 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         num_features = len(feature_names)
         num_heads = options.num_attention_heads
         embed_dim = options.pairwise_embedding_dim
+        eq2to2 = bool(getattr(options, "pairwise_eq2to2", False))
 
         self.pairwise_computer = PairwiseFeatureComputer(feature_names=feature_names)
 
@@ -144,7 +145,10 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         if self.block_mode:
             # One independent MLP (with its own masked BatchNorm) per collection.
             self.same_type_embeddings = nn.ModuleDict({
-                info["name"]: PairwiseEmbedding(num_features, num_heads, embed_dim)
+                info["name"]: PairwiseEmbedding(
+                    num_features=num_features, num_heads=num_heads,
+                    embed_dim=embed_dim, eq2to2=eq2to2,
+                )
                 for info in self.pairwise_collections
             })
 
@@ -164,7 +168,10 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
 
             name_of = {info["input_index"]: info["name"] for info in self.pairwise_collections}
             self.cross_type_embeddings = nn.ModuleDict({
-                self._cross_key(name_of[a], name_of[b]): PairwiseEmbedding(num_features, num_heads, embed_dim)
+                self._cross_key(name_of[a], name_of[b]): PairwiseEmbedding(
+                    num_features=num_features, num_heads=num_heads,
+                    embed_dim=embed_dim, eq2to2=eq2to2,
+                )
                 for (a, b) in self.cross_pairs
             })
         else:
@@ -173,6 +180,7 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
                 num_features=num_features,
                 num_heads=num_heads,
                 embed_dim=embed_dim,
+                eq2to2=eq2to2,
             )
 
     def _extract_kinematics(

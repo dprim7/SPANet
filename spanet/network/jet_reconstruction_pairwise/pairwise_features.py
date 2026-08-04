@@ -434,21 +434,59 @@ class PairwiseEmbedding(nn.Module):
     ParT uses BatchNorm + 1x1 Conv stacks to embed pairwise features into a
     per-head attention bias. We implement the same idea here, but with
     mask-aware BatchNorm so padded pairs do not corrupt the statistics.
+
+    With ``eq2to2=True`` each standardized channel is augmented with its
+    masked row-mean, column-mean, and global-mean broadcast maps before the
+    conv stack ("PELICAN-lite": the {identity, row-avg, col-avg, global-avg}
+    subset of the 15 Eq(2->2) equivariant basis ops, applied once -- not the
+    full iterated equivariant message passing). Row/col means are masked
+    averages so rectangular cross blocks and padded events are handled; only
+    conv1's input width changes (4F instead of F).
     """
 
-    def __init__(self, num_features: int, num_heads: int, embed_dim: int = 8):
+    def __init__(self, num_features: int, num_heads: int, embed_dim: int = 8,
+                 eq2to2: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.embed_dim = embed_dim
+        self.eq2to2 = bool(eq2to2)
 
         # Work on flattened pairs: (B, F, N*N). Masked BN over feature channels.
         self.input_bn = MaskedBatchNorm1d(num_features)
-        self.conv1 = nn.Conv1d(num_features, embed_dim, kernel_size=1)
+        conv1_in = 4 * num_features if self.eq2to2 else num_features
+        self.conv1 = nn.Conv1d(conv1_in, embed_dim, kernel_size=1)
         self.bn1 = MaskedBatchNorm1d(embed_dim)
         self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
         self.bn2 = MaskedBatchNorm1d(embed_dim)
         self.conv3 = nn.Conv1d(embed_dim, num_heads, kernel_size=1)
         self.act = nn.GELU()
+
+    @staticmethod
+    def _eq2to2_augment(x: Tensor, mask: Optional[Tensor],
+                        num_rows: int, num_cols: int) -> Tensor:
+        """Append masked row/col/global mean broadcast maps: (B,F,RC)->(B,4F,RC)."""
+        batch_size, num_features, _ = x.shape
+        x4 = x.view(batch_size, num_features, num_rows, num_cols)
+        if mask is None:
+            v = torch.ones(batch_size, 1, num_rows, num_cols, dtype=x.dtype, device=x.device)
+        else:
+            v = mask.view(batch_size, 1, num_rows, num_cols)
+
+        xv = x4 * v
+        row = xv.sum(dim=3, keepdim=True) / v.sum(dim=3, keepdim=True).clamp(min=1.0)
+        col = xv.sum(dim=2, keepdim=True) / v.sum(dim=2, keepdim=True).clamp(min=1.0)
+        glob = xv.sum(dim=(2, 3), keepdim=True) / v.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
+
+        out = torch.cat([
+            x4,
+            row.expand_as(x4),
+            col.expand_as(x4),
+            glob.expand_as(x4),
+        ], dim=1)
+        # Preserve the invalid-cells-are-zero invariant for the masked BNs
+        # downstream (broadcasts write into padded cells otherwise).
+        out = out * v
+        return out.view(batch_size, 4 * num_features, num_rows * num_cols)
 
     def forward(self, pairwise_features: Tensor, pair_mask: Optional[Tensor] = None) -> Tensor:
         # Blocks may be rectangular (rows != cols) for cross-type collections.
@@ -463,6 +501,8 @@ class PairwiseEmbedding(nn.Module):
             mask = pair_mask.reshape(batch_size, 1, num_rows * num_cols).to(x.dtype)
 
         x = self.input_bn(x, mask)
+        if self.eq2to2:
+            x = self._eq2to2_augment(x, mask, num_rows, num_cols)
         x = self.act(self.bn1(self.conv1(x), mask))
         x = self.act(self.bn2(self.conv2(x), mask))
         x = self.conv3(x)  # (B, H, R*C)

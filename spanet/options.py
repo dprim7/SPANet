@@ -183,6 +183,13 @@ class Options(Namespace):
         # num_pairwise_features of (kt, z, dr, m2).
         self.pairwise_feature_set: str = ""
 
+        # PELICAN-lite: augment each standardized pairwise channel with its
+        # masked row-mean, column-mean and global-mean broadcast maps before
+        # the pair MLP -- the {identity, row-avg, col-avg, global-avg} subset
+        # of the 15 Eq(2->2) equivariant basis ops, applied once. Only
+        # conv1's input width changes; never warm-start across this flag.
+        self.pairwise_eq2to2: bool = False
+
         # =========================================================================================
         # Mixture of Experts (MoE) Options
         # =========================================================================================
