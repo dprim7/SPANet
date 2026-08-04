@@ -175,6 +175,14 @@ class Options(Namespace):
         # blocks only.
         self.pairwise_cross_type: bool = True
 
+        # Which pairwise features to compute, as a "+"- or ","-joined token
+        # list. Tokens: kt, z, dr, m2, mink (Minkowski inner product,
+        # ln(2 p_i.p_j) = ln(m2_ij - m_i^2 - m_j^2), the PELICAN-style
+        # Lorentz invariant). Aliases: "part4" = kt,z,dr,m2 and "mink1" =
+        # mink. "" (default) = legacy behavior: the first
+        # num_pairwise_features of (kt, z, dr, m2).
+        self.pairwise_feature_set: str = ""
+
         # =========================================================================================
         # Mixture of Experts (MoE) Options
         # =========================================================================================

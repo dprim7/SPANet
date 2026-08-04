@@ -102,6 +102,56 @@ def auto_detect_kinematic_features(
     return result
 
 
+# Canonical pairwise feature names, in legacy prefix order (the first four
+# are the ParT set; "mink" is the PELICAN-style Lorentz invariant).
+CANONICAL_PAIRWISE_FEATURES = ("kt", "z", "dr", "m2", "mink")
+
+_FEATURE_SET_ALIASES = {
+    "part4": ("kt", "z", "dr", "m2"),
+    "mink1": ("mink",),
+}
+
+
+def parse_pairwise_feature_set(spec: str, legacy_num_features: int):
+    """Resolve options into an ordered tuple of pairwise feature names.
+
+    ``spec`` is a "+"- or ","-joined token list ("part4+mink", "mink",
+    "m2,mink", ...); aliases expand in place; duplicates are dropped keeping
+    first occurrence. An empty spec selects the legacy behavior: the first
+    ``legacy_num_features`` of (kt, z, dr, m2) -- values outside 1..4 are
+    rejected (the old code silently capped at 4).
+    """
+    spec = (spec or "").strip().lower()
+    if not spec:
+        if not 1 <= legacy_num_features <= 4:
+            raise ValueError(
+                f"num_pairwise_features={legacy_num_features} is invalid without "
+                f"pairwise_feature_set; the legacy prefix supports 1..4 "
+                f"({CANONICAL_PAIRWISE_FEATURES[:4]}). Set pairwise_feature_set "
+                f"(e.g. 'part4+mink') to use other combinations."
+            )
+        return CANONICAL_PAIRWISE_FEATURES[:legacy_num_features]
+
+    names = []
+    for token in spec.replace("+", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        expanded = _FEATURE_SET_ALIASES.get(token, (token,))
+        for name in expanded:
+            if name not in CANONICAL_PAIRWISE_FEATURES:
+                raise ValueError(
+                    f"Unknown pairwise feature '{name}' in pairwise_feature_set="
+                    f"'{spec}'. Known: {CANONICAL_PAIRWISE_FEATURES} "
+                    f"(aliases: {tuple(_FEATURE_SET_ALIASES)})."
+                )
+            if name not in names:
+                names.append(name)
+    if not names:
+        raise ValueError(f"pairwise_feature_set='{spec}' selects no features")
+    return tuple(names)
+
+
 def extract_physical_kinematics(
     source_data: Tensor,
     kin: dict,
@@ -212,9 +262,14 @@ class PairwiseFeatureComputer(nn.Module):
     for the unified (shared-MLP) path and existing tests.
     """
 
-    def __init__(self, num_features: int = 4, eps: float = 1e-7):
+    def __init__(self, num_features: int = 4, eps: float = 1e-7, feature_names=None):
         super().__init__()
-        self.num_features = num_features
+        # feature_names wins when given; otherwise legacy prefix of the
+        # canonical order (kt, z, dr, m2) selected by num_features.
+        if feature_names is None:
+            feature_names = parse_pairwise_feature_set("", num_features)
+        self.feature_names = tuple(feature_names)
+        self.num_features = len(self.feature_names)
         self.eps = eps
 
     @staticmethod
@@ -248,41 +303,51 @@ class PairwiseFeatureComputer(nn.Module):
         if mass_j is None:
             mass_j = torch.zeros_like(pt_j)
 
-        # Following ParT: ln(kt), ln(z), ln(deltaR), ln(m^2) from kinematics.
-        # Rapidity is approximated with pseudorapidity (eta).
-        px_i, py_i, pz_i, e_i = self._four_vector(pt_i, eta_i, phi_i, mass_i, self.eps)
-        px_j, py_j, pz_j, e_j = self._four_vector(pt_j, eta_j, phi_j, mass_j, self.eps)
+        # Feature menu (rapidity approximated with pseudorapidity):
+        #   kt, z, dr, m2 -- the ParT set: ln(kt), ln(z), ln(deltaR), ln(m^2)
+        #   mink -- PELICAN-style Lorentz invariant ln(2 p_i.p_j); note
+        #           2 p_i.p_j = m2_ij - m_i^2 - m_j^2, the pair mass with the
+        #           self-masses removed, in the same numeric band as ln(m^2).
+        need_angular = any(f in self.feature_names for f in ("kt", "z", "dr"))
+        need_vectors = any(f in self.feature_names for f in ("m2", "mink"))
+
+        if need_vectors:
+            px_i, py_i, pz_i, e_i = self._four_vector(pt_i, eta_i, phi_i, mass_i, self.eps)
+            px_j, py_j, pz_j, e_j = self._four_vector(pt_j, eta_j, phi_j, mass_j, self.eps)
+            px_i, px_j = px_i.unsqueeze(2), px_j.unsqueeze(1)
+            py_i, py_j = py_i.unsqueeze(2), py_j.unsqueeze(1)
+            pz_i, pz_j = pz_i.unsqueeze(2), pz_j.unsqueeze(1)
+            e_i, e_j = e_i.unsqueeze(2), e_j.unsqueeze(1)
 
         # Broadcast rows (i, dim 2) against columns (j, dim 1) -> (B, Ni, Nj).
         pt_i, pt_j = pt_i.unsqueeze(2), pt_j.unsqueeze(1)
         eta_i, eta_j = eta_i.unsqueeze(2), eta_j.unsqueeze(1)
         phi_i, phi_j = phi_i.unsqueeze(2), phi_j.unsqueeze(1)
-        px_i, px_j = px_i.unsqueeze(2), px_j.unsqueeze(1)
-        py_i, py_j = py_i.unsqueeze(2), py_j.unsqueeze(1)
-        pz_i, pz_j = pz_i.unsqueeze(2), pz_j.unsqueeze(1)
-        e_i, e_j = e_i.unsqueeze(2), e_j.unsqueeze(1)
+
+        if need_angular:
+            d_eta = eta_i - eta_j
+            d_phi = delta_phi(phi_i, phi_j)
+            delta_r = torch.sqrt(d_eta**2 + d_phi**2 + self.eps)
+            pt_min = torch.minimum(pt_i, pt_j)
 
         features = []
-
-        d_eta = eta_i - eta_j
-        d_phi = delta_phi(phi_i, phi_j)
-        delta_r = torch.sqrt(d_eta**2 + d_phi**2 + self.eps)
-        pt_min = torch.minimum(pt_i, pt_j)
-
-        kt = pt_min * delta_r
-        features.append(torch.log(kt.clamp(min=self.eps)))
-
-        if self.num_features >= 2:
-            z = pt_min / (pt_i + pt_j + self.eps)
-            features.append(torch.log(z.clamp(min=self.eps)))
-
-        if self.num_features >= 3:
-            features.append(torch.log(delta_r.clamp(min=self.eps)))
-
-        if self.num_features >= 4:
-            m2 = (e_i + e_j) ** 2 - (px_i + px_j) ** 2 - (py_i + py_j) ** 2 - (pz_i + pz_j) ** 2
-            m2 = m2.clamp(min=self.eps)
-            features.append(torch.log(m2))
+        for name in self.feature_names:
+            if name == "kt":
+                kt = pt_min * delta_r
+                features.append(torch.log(kt.clamp(min=self.eps)))
+            elif name == "z":
+                z = pt_min / (pt_i + pt_j + self.eps)
+                features.append(torch.log(z.clamp(min=self.eps)))
+            elif name == "dr":
+                features.append(torch.log(delta_r.clamp(min=self.eps)))
+            elif name == "m2":
+                m2 = (e_i + e_j) ** 2 - (px_i + px_j) ** 2 - (py_i + py_j) ** 2 - (pz_i + pz_j) ** 2
+                features.append(torch.log(m2.clamp(min=self.eps)))
+            elif name == "mink":
+                dot = e_i * e_j - px_i * px_j - py_i * py_j - pz_i * pz_j
+                features.append(torch.log((2.0 * dot).clamp(min=self.eps)))
+            else:  # pragma: no cover -- guarded by parse_pairwise_feature_set
+                raise ValueError(f"Unknown pairwise feature '{name}'")
 
         pairwise_features = torch.stack(features, dim=-1)
 

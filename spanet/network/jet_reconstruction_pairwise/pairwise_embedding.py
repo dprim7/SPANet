@@ -53,6 +53,7 @@ from .pairwise_features import (
     auto_detect_kinematic_features,
     combine_collection_kinematics,
     extract_physical_kinematics,
+    parse_pairwise_feature_set,
 )
 
 
@@ -129,11 +130,15 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
                 f"Available: {list(event_info.input_types.keys())}"
             )
 
-        num_features = options.num_pairwise_features
+        feature_names = parse_pairwise_feature_set(
+            getattr(options, "pairwise_feature_set", ""),
+            options.num_pairwise_features,
+        )
+        num_features = len(feature_names)
         num_heads = options.num_attention_heads
         embed_dim = options.pairwise_embedding_dim
 
-        self.pairwise_computer = PairwiseFeatureComputer(num_features=num_features)
+        self.pairwise_computer = PairwiseFeatureComputer(feature_names=feature_names)
 
         self.block_mode = bool(getattr(options, "pairwise_block_embeddings", False))
         if self.block_mode:
