@@ -239,6 +239,11 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             class_indices = (masks * self.particle_index_tensor.unsqueeze(1)).sum(0)
             weights *= self.particle_weights_tensor[class_indices]
 
+        # Deliberate per-particle (topology) reweighting. Constant per target, so it
+        # is invariant under the within-topology permutation applied above.
+        if self.particle_loss_weights:
+            weights = weights * self.particle_loss_weights_tensor
+
         # Balance based on the number of jets in this event
         if self.balance_jets:
             weights *= self.jet_weights_tensor[batch.num_vectors]

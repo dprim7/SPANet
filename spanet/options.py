@@ -226,7 +226,20 @@ class Options(Namespace):
         self.limit_to_num_jets: int = 0
 
         # Whether or not to add weight to classes based on their training data prevalence.
+        # NOTE: this weights each event by its TOPOLOGY-PRESENCE class using an
+        # inverse-effective-frequency rule. On multi-topology event files the class
+        # count explodes and the weight spread can reach O(10^4), which both starves
+        # the common classes and shrinks the mean loss scale (making the fixed
+        # l2_penalty dominate). Prefer particle_loss_weights below for deliberate
+        # topology reweighting.
         self.balance_particles: bool = False
+
+        # Deliberate per-particle loss weights, e.g. "FRt:3,SRqqt:2,FBt:1".
+        # Keys are matched as PREFIXES of the particle names in the event file, so
+        # "FRt" covers FRt1 and FRt2. Weights are renormalized to mean 1.0 across
+        # targets, so the overall loss scale (and hence the effective weight decay)
+        # is unchanged relative to the default. Empty string disables.
+        self.particle_loss_weights: str = ""
 
         # Whether or not to add a weight to the jet multiplicity to not forget about large events.
         self.balance_jets: bool = False

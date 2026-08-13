@@ -12,6 +12,60 @@ from spanet.network.learning_rate_schedules import get_linear_schedule_with_warm
 from spanet.network.learning_rate_schedules import get_cosine_with_hard_restarts_schedule_with_warmup
 
 
+def parse_particle_loss_weights(spec: str, particle_names):
+    """Parse a "prefix:weight" spec into one weight per particle, mean-normalized.
+
+    Prefixes are matched against the start of each particle name, longest first,
+    so "FRt:3,SRqqt:2,FBt:1" assigns 3 to FRt1/FRt2, 2 to SRqqt1/SRqqt2 and 1 to
+    FBt1/FBt2. Particles matching no prefix keep weight 1.0. The resulting vector
+    is scaled to have mean 1.0 so the total loss scale is preserved.
+    """
+    rules = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Malformed particle_loss_weights entry {item!r}, expected 'prefix:weight'")
+        prefix, value = item.rsplit(":", 1)
+        rules.append((prefix.strip(), float(value)))
+
+    # longest prefix wins, so a specific name can override a topology-wide rule
+    rules.sort(key=lambda rule: -len(rule[0]))
+
+    weights = []
+    for name in particle_names:
+        weight = 1.0
+        for prefix, value in rules:
+            if name.startswith(prefix):
+                weight = value
+                break
+        weights.append(weight)
+
+    # A spec that matches nothing at all is certainly a mistake (the user believes
+    # they are reweighting and silently are not). Individual unmatched prefixes are
+    # legitimate: the same spec is reused across event files whose topologies
+    # differ, e.g. a resolved-only file has no SRqq/FB particles.
+    matched = {
+        prefix for prefix, _ in rules
+        if any(name.startswith(prefix) for name in particle_names)
+    }
+    if rules and not matched:
+        raise ValueError(
+            f"particle_loss_weights {sorted(p for p, _ in rules)} match no particle in "
+            f"{list(particle_names)} -- the spec would do nothing"
+        )
+    for prefix, _ in rules:
+        if prefix not in matched:
+            print(f"    note: particle_loss_weights prefix '{prefix}' matches no particle "
+                  f"in this event file, ignoring")
+
+    mean = sum(weights) / len(weights)
+    if mean <= 0:
+        raise ValueError("particle_loss_weights must have a positive mean")
+    return [w / mean for w in weights]
+
+
 class JetReconstructionBase(pl.LightningModule):
     def __init__(self, options: Options):
         super(JetReconstructionBase, self).__init__()
@@ -28,6 +82,21 @@ class JetReconstructionBase(pl.LightningModule):
             self.particle_index_tensor = torch.nn.Parameter(index_tensor, requires_grad=False)
             self.particle_weights_tensor = torch.nn.Parameter(weights_tensor, requires_grad=False)
             self.balance_particles = True
+
+        # Deliberate per-particle (topology) loss weights -- see Options.
+        self.particle_loss_weights = False
+        spec = getattr(options, "particle_loss_weights", "") or ""
+        if spec.strip():
+            names = list(self.training_dataset.assignments.keys())
+            weights = parse_particle_loss_weights(spec, names)
+            # shape (num_targets, 1, 1) so it broadcasts over (assignment, detection)
+            # and over the batch in the training loss.
+            tensor = torch.tensor(weights, dtype=torch.float32).view(-1, 1, 1)
+            self.particle_loss_weights_tensor = torch.nn.Parameter(tensor, requires_grad=False)
+            self.particle_loss_weights = True
+            print("Per-particle loss weights (normalized to mean 1.0):")
+            for name, weight in zip(names, weights):
+                print(f"    {name}: {weight:.4f}")
 
         # Compute class weights for jets from the training dataset target distribution
         self.balance_jets = False
