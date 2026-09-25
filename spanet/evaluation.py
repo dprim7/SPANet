@@ -1,3 +1,6 @@
+import os
+import re
+import warnings
 from glob import glob
 from typing import Optional, Union, Tuple
 
@@ -42,6 +45,96 @@ def tree_concatenate(trees):
     return tree_unflatten(results, tree_spec)
 
 
+def find_best_checkpoint(log_directory: str) -> str:
+    """Return the path of the best checkpoint written by Lightning.
+
+    The obvious `sorted(glob("checkpoints/epoch*"))[-1]` is wrong in two ways:
+    filenames sort as TEXT, so "epoch=9" ranks above "epoch=17", and even when
+    every retained epoch has the same number of digits it returns the newest of
+    the retained checkpoints rather than the best-scoring one.
+
+    Resolution order:
+
+    1. Lightning stores its ModelCheckpoint state (including ``best_model_path``
+       and the monitored metric) inside every checkpoint it writes. We read that
+       state and re-base ``best_model_path`` onto ``log_directory`` by basename,
+       so it still resolves when the run directory has been copied or moved off
+       the training machine.
+    2. Failing that, parse the monitored metric out of the filenames, which the
+       default ``filename`` template embeds, and take the best according to the
+       recorded mode.
+    3. Failing that, fall back to the highest epoch/step ordered NUMERICALLY,
+       and warn that this is the latest checkpoint rather than the best.
+    """
+    checkpoint_directory = os.path.join(log_directory, "checkpoints")
+    candidates = glob(os.path.join(checkpoint_directory, "epoch*"))
+    if not candidates:
+        raise FileNotFoundError(f"No epoch checkpoints found in {checkpoint_directory}")
+
+    # ---- 1. the checkpoint callback's own record of the best model ----------
+    state_source = os.path.join(checkpoint_directory, "last.ckpt")
+    if not os.path.exists(state_source):
+        state_source = candidates[0]
+
+    best_path, monitor, mode = None, None, None
+    try:
+        # weights_only defaults to True from torch 2.6, which refuses the plain
+        # python objects in the callback state; ask for the full load explicitly
+        # and stay compatible with versions that lack the argument.
+        try:
+            state = torch.load(state_source, map_location="cpu", weights_only=False)
+        except TypeError:
+            state = torch.load(state_source, map_location="cpu")
+        for key, callback_state in (state.get("callbacks") or {}).items():
+            if "ModelCheckpoint" not in str(key) or not isinstance(callback_state, dict):
+                continue
+            best_path = callback_state.get("best_model_path") or best_path
+            monitor = callback_state.get("monitor") or monitor
+            mode = callback_state.get("mode") or mode
+            # the key itself carries the monitor/mode for most Lightning versions
+            if monitor is None:
+                found = re.search(r"'monitor': '([^']+)'", str(key))
+                monitor = found.group(1) if found else None
+            if mode is None:
+                found = re.search(r"'mode': '([^']+)'", str(key))
+                mode = found.group(1) if found else None
+    except Exception as error:  # a corrupt or partial checkpoint must not be fatal
+        warnings.warn(f"Could not read checkpoint callback state from {state_source}: {error}")
+
+    if best_path:
+        rebased = os.path.join(checkpoint_directory, os.path.basename(best_path))
+        if os.path.exists(rebased):
+            return rebased
+
+    # ---- 2. parse the monitored metric out of the filenames -----------------
+    if monitor:
+        pattern = re.compile(re.escape(monitor) + r"=(-?[0-9]+\.?[0-9]*)")
+        scored = []
+        for path in candidates:
+            found = pattern.search(os.path.basename(path))
+            if found:
+                scored.append((float(found.group(1)), path))
+        if scored:
+            pick = min if (mode or "max") == "min" else max
+            return pick(scored, key=lambda item: item[0])[1]
+
+    # ---- 3. numeric epoch/step ordering, clearly flagged --------------------
+    def epoch_step(path: str):
+        name = os.path.basename(path)
+        epoch = re.search(r"epoch=(\d+)", name)
+        step = re.search(r"step=(\d+)", name)
+        return (int(epoch.group(1)) if epoch else -1,
+                int(step.group(1)) if step else -1)
+
+    latest = max(candidates, key=epoch_step)
+    warnings.warn(
+        "Could not determine the best checkpoint from the callback state or the "
+        f"filenames; falling back to the LATEST checkpoint ({os.path.basename(latest)}). "
+        "Pass an explicit checkpoint to avoid this."
+    )
+    return latest
+
+
 def load_model(
     log_directory: str,
     testing_file: Optional[str] = None,
@@ -54,7 +147,7 @@ def load_model(
 ) -> JetReconstructionModel:
     # Load the best-performing checkpoint on validation data
     if checkpoint is None:
-        checkpoint = sorted(glob(f"{log_directory}/checkpoints/epoch*"))[-1]
+        checkpoint = find_best_checkpoint(log_directory)
         print(f"Loading: {checkpoint}")
 
     checkpoint = torch.load(checkpoint, map_location='cpu')
