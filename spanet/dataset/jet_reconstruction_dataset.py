@@ -341,7 +341,7 @@ class JetReconstructionDataset(Dataset):
             if value is not None
         ))
 
-    def compute_particle_balance(self, balance_by_prevalence: bool, recotype_weights: None|dict):
+    def compute_particle_balance(self, balance_by_prevalence: bool, recotype_weights: Optional[dict]):
         assert balance_by_prevalence or recotype_weights is not None, f"At least one of \'balance_by_prevalence\' or \'recotype_weights\' must be selected for balancing"
         # Extract just the mask information from the dataset.
         masks = torch.stack([target[1] for target in self.assignments.values()])
