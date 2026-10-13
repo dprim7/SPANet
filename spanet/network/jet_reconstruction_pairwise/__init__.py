@@ -9,9 +9,12 @@ functionality is activated through hooks in
 """
 
 from .pairwise_features import (
+    CANONICAL_PAIRWISE_FEATURES,
     PairwiseFeatureComputer,
     PairwiseEmbedding,
     auto_detect_kinematic_features,
+    extract_physical_kinematics,
+    parse_pairwise_feature_set,
     sincos_to_phi,
 )
 from .pairwise_transformer import create_transformer_with_pairwise
@@ -19,9 +22,12 @@ from .pairwise_encoder import JetEncoderWithPairwise, StackedEncoderWithPairwise
 from .pairwise_embedding import MultiInputVectorEmbeddingWithPairwise
 
 __all__ = [
+    "CANONICAL_PAIRWISE_FEATURES",
     "PairwiseFeatureComputer",
     "PairwiseEmbedding",
     "auto_detect_kinematic_features",
+    "extract_physical_kinematics",
+    "parse_pairwise_feature_set",
     "sincos_to_phi",
     "create_transformer_with_pairwise",
     "JetEncoderWithPairwise",

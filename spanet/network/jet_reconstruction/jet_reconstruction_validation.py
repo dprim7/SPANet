@@ -47,7 +47,11 @@ class JetReconstructionValidation(JetReconstructionNetwork):
         # First compute raw_old accuracy so that we can get an accuracy score for each event
         # This will also act as the method for choosing the best permutation to compare for the other metrics.
         jet_accuracies = np.zeros((num_permutations, num_targets, batch_size), dtype=bool)
-        weighted_jet_accuracies = np.zeros((num_permutations, num_targets, batch_size), dtype=bool)
+        # float, NOT bool: this array stores accuracy * weight. With a bool
+        # dtype any non-zero per-target weight silently truncates to 1 while
+        # the denominator (tot_target_weights) keeps the real weights, biasing
+        # validation_average_jet_accuracy whenever weights != 1.
+        weighted_jet_accuracies = np.zeros((num_permutations, num_targets, batch_size), dtype=np.float64)
         particle_accuracies = np.zeros((num_permutations, num_targets, batch_size), dtype=bool)
         for i, permutation in enumerate(event_permutation_group):
             for j, (prediction, target, weight) in enumerate(zip(jet_predictions, stacked_targets[permutation], stacked_weights[permutation])):
@@ -96,6 +100,13 @@ class JetReconstructionValidation(JetReconstructionNetwork):
 
         # Compute the sum accuracy of all complete events to act as our target for
         # early stopping, hyperparameter optimization, learning rate scheduling, etc.
+        # CAVEAT (multi-topology event files): this is the mean over events where
+        # ALL num_targets particles are present. For event files whose topologies
+        # are mutually exclusive (e.g. FR/SRqq/FB tops -- no event can have all
+        # six targets), that selection is empty, the mean is NaN, and NaN metrics
+        # are skipped by the logger -- so "validation_accuracy" is silently never
+        # logged. Do not optimize sweeps or early stopping on it in that setup;
+        # use validation_average_jet_accuracy instead.
         metrics["validation_accuracy"] = metrics[f"jet/accuracy_{num_targets}_of_{num_targets}"]
 
         has_targets = tot_target_weights > 0

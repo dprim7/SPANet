@@ -1,19 +1,38 @@
 """Embedding layers with pairwise interaction support.
 
 Extends the standard multi-input embedding to compute and return a pairwise
-attention bias over the *full* concatenated particle sequence.
+attention bias over the FULL concatenated sequence of jet collections.
 
-The bias is assembled block-by-block over the sequential inputs:
+Design rationale (multi-collection pairwise):
+    SPANet's encoder attends over one combined sequence built by concatenating
+    every input collection (e.g. Jets + BoostedJets + VeryBoostedJets), so the
+    pairwise bias must be an N_total x N_total matrix aligned with that
+    sequence. We compute the ParT-style features (ln kt, ln z, ln deltaR,
+    ln m^2) for ALL participating collections -- covering both intra-collection
+    pairs (Jet-Jet, Boosted-Boosted) and cross-collection pairs (Jet-Boosted),
+    which matter physically (e.g. a semi-resolved top is a small-R b-jet paired
+    with a boosted W fatjet).
 
-    * Same-type blocks (a collection with itself, e.g. Jets-Jets,
-      BoostedJets-BoostedJets) are each embedded by their own MLP.
-    * Cross-type blocks (two different collections, e.g. Jets-BoostedJets)
-      are embedded by an *independent* MLP, and are only created when a
-      resonance in the event file is built from more than one kind of jet
-      (a "cross-type resonance", such as SRqqt1 = b: Jets + qq: BoostedJets).
+    The enabling prerequisite is recovery to physical units: the raw
+    ``sources`` tensors carry log1p-transformed values for ``log_scale``
+    features (``SequentialInput.load`` applies ``log(x+1)`` at load; z-scoring
+    happens ONLY later, out-of-place, inside ``CombinedVectorEmbedding`` via
+    ``Normalizer`` and never mutates ``sources``). Each collection is
+    therefore recovered to physical units (GeV / radians) by undoing exactly
+    the log transform -- no mean/std is involved -- BEFORE pair features are
+    computed; only then are cross-collection deltaR / m^2 meaningful.
+    Kinematics are laid out in the SAME order the embeddings are stacked so
+    that bias position k refers to the same jet as attention position k
+    (guarded at runtime).
 
-This lets resonances made of mixed jet types receive proper pairwise features
-instead of a zeroed-out attention bias.
+Two embedding structures are available (options.pairwise_block_embeddings):
+    * unified (False): one shared MLP + masked BatchNorm over ALL pairs.
+    * block (True): an independent MLP (with its own masked BatchNorm) per
+      pair-type block -- one per collection (same-type) and one per
+      resonance-coupled collection pair (cross-type). Different pair
+      populations (Jet-Jet vs Boosted-Boosted vs Jet-Boosted) have very
+      different kinematic distributions; per-block normalization treats each
+      population on its own terms instead of pooling them.
 """
 
 from typing import List, Optional, Tuple
@@ -32,18 +51,19 @@ from .pairwise_features import (
     PairwiseFeatureComputer,
     PairwiseEmbedding,
     auto_detect_kinematic_features,
-    sincos_to_phi,
+    combine_collection_kinematics,
+    extract_physical_kinematics,
+    parse_pairwise_feature_set,
 )
 
 
 class MultiInputVectorEmbeddingWithPairwise(nn.Module):
-    """Multi-input embedding with per-type and cross-type pairwise features."""
+    """Multi-input embedding with multi-collection pairwise feature computation."""
 
     def __init__(self, options: Options, training_dataset: JetReconstructionDataset):
         super().__init__()
 
         self.options = options
-        self.num_heads = options.num_attention_heads
 
         self.vector_embedding_layers = nn.ModuleList(
             [
@@ -61,153 +81,122 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
 
         self._setup_pairwise_features(options, training_dataset)
 
-    # ------------------------------------------------------------------ setup
     @staticmethod
     def _cross_key(name_a: str, name_b: str) -> str:
         """Order-independent module key for a cross-type block."""
-        first, second = sorted((name_a, name_b))
-        return f"{first}___{second}"
+        return "__x__".join(sorted((name_a, name_b)))
 
     def _setup_pairwise_features(self, options: Options, training_dataset: JetReconstructionDataset):
         event_info = training_dataset.event_info
-        input_names = list(event_info.input_types.keys())
-        self.input_names = input_names
 
-        # -----------------------------------------------------------------
-        # Determine which SEQUENTIAL inputs participate in pairwise features.
-        # An explicit pairwise_input_source restricts to a single collection
-        # (legacy single-block behaviour); the default ("") uses all of them.
-        # -----------------------------------------------------------------
-        restrict = options.pairwise_input_source
-        self.sequential_indices: List[int] = []
-        for idx, name in enumerate(input_names):
-            if event_info.input_types[name] == InputType.Sequential:
-                if restrict == "" or restrict == name:
-                    self.sequential_indices.append(idx)
+        # Which SEQUENTIAL collections participate. "" or "all" -> every
+        # sequential collection (default); a single name or list restricts it.
+        requested = getattr(options, "pairwise_input_source", "")
+        if isinstance(requested, str):
+            requested_set = None if requested.strip().lower() in ("", "all") else {requested}
+        else:
+            requested_set = set(requested)
 
-        if len(self.sequential_indices) == 0:
+        self.pairwise_collections = []
+        for idx, (input_name, input_type) in enumerate(event_info.input_types.items()):
+            if input_type != InputType.Sequential:
+                continue
+            if requested_set is not None and input_name not in requested_set:
+                continue
+
+            feature_infos = event_info.input_features[input_name]
+            feature_names = [f.name for f in feature_infos]
+            kin = auto_detect_kinematic_features(feature_names, input_name)
+
+            info = {
+                "input_index": idx,
+                "name": input_name,
+                "kin": kin,
+                # The raw sources tensors are log1p-transformed at load for
+                # log_scale features and NEVER z-scored (Normalizer runs
+                # out-of-place downstream) -- recovery needs only these flags.
+                "pt_is_log": bool(feature_infos[kin["pt_idx"]].log_scale),
+                "mass_is_log": bool(
+                    kin["mass_idx"] >= 0 and feature_infos[kin["mass_idx"]].log_scale
+                ),
+            }
+
+            self.pairwise_collections.append(info)
+
+        if not self.pairwise_collections:
             raise ValueError(
-                "Could not find SEQUENTIAL input for pairwise features. "
-                f"Specified: '{options.pairwise_input_source}', "
-                f"Available: {list(event_info.input_types.items())}"
+                "Could not find any SEQUENTIAL input for pairwise features. "
+                f"Specified: '{requested}', "
+                f"Available: {list(event_info.input_types.keys())}"
             )
 
-        # Make sure normalization statistics exist before we snapshot them.
-        if options.normalize_features and training_dataset.mean is None:
-            training_dataset.compute_source_statistics()
-
-        # -----------------------------------------------------------------
-        # Per-input kinematic indices, transform flags, and de-norm stats.
-        # -----------------------------------------------------------------
-        self.kinematics = {}
-        for idx in self.sequential_indices:
-            name = input_names[idx]
-            feature_infos = event_info.input_features[name]
-            feature_names = [f.name for f in feature_infos]
-            kin = auto_detect_kinematic_features(feature_names, name)
-
-            pt_idx = kin["pt_idx"]
-            eta_idx = kin["eta_idx"]
-            mass_idx = kin["mass_idx"]
-
-            kin["pt_is_log"] = bool(feature_infos[pt_idx].log_scale)
-            kin["eta_is_normalized"] = bool(feature_infos[eta_idx].normalize)
-            if not kin["use_sincos_phi"]:
-                kin["phi_is_normalized"] = bool(feature_infos[kin["phi_idx"]].normalize)
-            else:
-                # sin/cos phi live in [-1, 1] and are not normalized.
-                kin["phi_is_normalized"] = False
-            kin["mass_is_normalized"] = bool(mass_idx >= 0 and feature_infos[mass_idx].normalize)
-
-            self.kinematics[idx] = kin
-
-            # Store de-normalization stats (mean/std) as buffers so eta/phi/mass
-            # can be recovered to physical units. Registered per-input.
-            if options.normalize_features:
-                mean = training_dataset.mean[name].clone().detach()
-                std = training_dataset.std[name].clone().detach()
-            else:
-                mean = torch.zeros(len(feature_infos))
-                std = torch.ones(len(feature_infos))
-            self.register_buffer(f"denorm_mean_{idx}", mean)
-            self.register_buffer(f"denorm_std_{idx}", std)
-
-        # -----------------------------------------------------------------
-        # Detect cross-type resonances: an event particle whose daughters are
-        # drawn from more than one participating SEQUENTIAL collection.
-        # -----------------------------------------------------------------
-        self.cross_pairs: List[Tuple[int, int]] = []
-        if getattr(options, "pairwise_cross_type", True):
-            seq_set = set(self.sequential_indices)
-            coupled = set()
-            for _particle, products in event_info.product_particles.items():
-                sources = sorted({s for s in products.sources if s in seq_set})
-                for a_pos in range(len(sources)):
-                    for b_pos in range(a_pos + 1, len(sources)):
-                        coupled.add((sources[a_pos], sources[b_pos]))
-            self.cross_pairs = sorted(coupled)
-
-        # -----------------------------------------------------------------
-        # Feature computer (shared) and the per-block embedding MLPs.
-        # -----------------------------------------------------------------
-        num_features = options.num_pairwise_features
+        feature_names = parse_pairwise_feature_set(
+            getattr(options, "pairwise_feature_set", ""),
+            options.num_pairwise_features,
+        )
+        num_features = len(feature_names)
         num_heads = options.num_attention_heads
         embed_dim = options.pairwise_embedding_dim
+        eq2to2 = bool(getattr(options, "pairwise_eq2to2", False))
 
-        self.pairwise_computer = PairwiseFeatureComputer(num_features=num_features)
+        self.pairwise_computer = PairwiseFeatureComputer(feature_names=feature_names)
 
-        # One independent MLP per collection (Jets-only, BoostedJets-only, ...).
-        self.same_type_embeddings = nn.ModuleDict({
-            input_names[idx]: PairwiseEmbedding(num_features, num_heads, embed_dim)
-            for idx in self.sequential_indices
-        })
+        self.block_mode = bool(getattr(options, "pairwise_block_embeddings", False))
+        if self.block_mode:
+            # One independent MLP (with its own masked BatchNorm) per collection.
+            self.same_type_embeddings = nn.ModuleDict({
+                info["name"]: PairwiseEmbedding(
+                    num_features=num_features, num_heads=num_heads,
+                    embed_dim=embed_dim, eq2to2=eq2to2,
+                )
+                for info in self.pairwise_collections
+            })
 
-        # One independent MLP per coupled cross-type collection pair.
-        self.cross_type_embeddings = nn.ModuleDict({
-            self._cross_key(input_names[a], input_names[b]): PairwiseEmbedding(num_features, num_heads, embed_dim)
-            for (a, b) in self.cross_pairs
-        })
+            # Cross-type blocks only for collection pairs coupled by a
+            # resonance in the event file (an event particle whose daughters
+            # are drawn from more than one participating collection).
+            self.cross_pairs: List[Tuple[int, int]] = []
+            if getattr(options, "pairwise_cross_type", True):
+                seq_set = {info["input_index"] for info in self.pairwise_collections}
+                coupled = set()
+                for _particle, products in event_info.product_particles.items():
+                    sources = sorted({s for s in products.sources if s in seq_set})
+                    for a_pos in range(len(sources)):
+                        for b_pos in range(a_pos + 1, len(sources)):
+                            coupled.add((sources[a_pos], sources[b_pos]))
+                self.cross_pairs = sorted(coupled)
 
-    # -------------------------------------------------------------- kinematics
-    def _extract_kinematics(
-        self, idx: int, source_data: Tensor, source_mask: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Tensor]:
-        """Recover physical (pt, eta, phi, mass) for a single sequential input."""
-        kin = self.kinematics[idx]
-        mean = getattr(self, f"denorm_mean_{idx}", None)
-        std = getattr(self, f"denorm_std_{idx}", None)
-
-        # pt: undo log(1 + pt) transform if applied.
-        pt = source_data[:, :, kin["pt_idx"]]
-        if kin["pt_is_log"]:
-            pt = torch.expm1(pt).clamp(min=0)
-
-        # eta: undo z-score normalization if applied.
-        eta = source_data[:, :, kin["eta_idx"]]
-        if kin["eta_is_normalized"] and mean is not None:
-            eta = eta * std[kin["eta_idx"]] + mean[kin["eta_idx"]]
-
-        # phi: from sin/cos or directly (denormalized if needed).
-        if kin["use_sincos_phi"]:
-            sinphi = source_data[:, :, kin["sinphi_idx"]]
-            cosphi = source_data[:, :, kin["cosphi_idx"]]
-            phi = sincos_to_phi(sinphi, cosphi)
+            name_of = {info["input_index"]: info["name"] for info in self.pairwise_collections}
+            self.cross_type_embeddings = nn.ModuleDict({
+                self._cross_key(name_of[a], name_of[b]): PairwiseEmbedding(
+                    num_features=num_features, num_heads=num_heads,
+                    embed_dim=embed_dim, eq2to2=eq2to2,
+                )
+                for (a, b) in self.cross_pairs
+            })
         else:
-            phi = source_data[:, :, kin["phi_idx"]]
-            if kin["phi_is_normalized"] and mean is not None:
-                phi = phi * std[kin["phi_idx"]] + mean[kin["phi_idx"]]
+            # Unified: one shared MLP + masked BatchNorm over all pairs.
+            self.pairwise_embedding = PairwiseEmbedding(
+                num_features=num_features,
+                num_heads=num_heads,
+                embed_dim=embed_dim,
+                eq2to2=eq2to2,
+            )
 
-        # mass: undo z-score normalization if applied.
-        mass = None
-        if kin["mass_idx"] >= 0:
-            mass = source_data[:, :, kin["mass_idx"]]
-            if kin["mass_is_normalized"] and mean is not None:
-                mass = mass * std[kin["mass_idx"]] + mean[kin["mass_idx"]]
-                mass = mass.clamp(min=0)
+    def _extract_kinematics(
+        self, info: dict, source_data: Tensor, source_mask: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Tensor]:
+        """Recover PHYSICAL (pt, eta, phi, mass) for one collection.
 
+        Thin wrapper over :func:`extract_physical_kinematics` -- the raw
+        ``sources`` tensors are log1p-transformed only (never z-scored), so
+        recovery is expm1 for log_scale features and identity otherwise.
+        """
+        pt, eta, phi, mass = extract_physical_kinematics(
+            source_data, info["kin"], info["pt_is_log"], info["mass_is_log"]
+        )
         return pt, eta, phi, mass, source_mask
 
-    # ------------------------------------------------------------------ forward
     def forward(
         self, sources: List[Tuple[Tensor, Tensor]]
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
@@ -215,7 +204,6 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         padding_masks = []
         sequence_masks = []
         global_masks = []
-        seq_lengths = []
 
         for input_index, vector_embedding_layer in enumerate(self.vector_embedding_layers):
             source_data, source_mask = sources[input_index]
@@ -225,8 +213,6 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
             padding_masks.append(current_embeddings[1])
             sequence_masks.append(current_embeddings[2])
             global_masks.append(current_embeddings[3])
-            # Sequence length this input occupies in the concatenated sequence.
-            seq_lengths.append(current_embeddings[0].shape[0])
 
         embeddings = torch.cat(embeddings, dim=0)
         padding_masks = torch.cat(padding_masks, dim=1)
@@ -238,52 +224,79 @@ class MultiInputVectorEmbeddingWithPairwise(nn.Module):
         total_seq_len = embeddings.shape[0]
         batch_size = embeddings.shape[1]
 
-        # Offset of every input inside the concatenated particle sequence.
+        # Per-input segment lengths + offsets, in the SAME order the
+        # embeddings were concatenated above (alignment is guarded below).
+        lengths = []
+        for input_index in range(len(self.vector_embedding_layers)):
+            source_data, _ = sources[input_index]
+            lengths.append(source_data.shape[1] if source_data.dim() == 3 else 1)
         offsets = [0]
-        for length in seq_lengths:
+        for length in lengths:
             offsets.append(offsets[-1] + length)
 
-        # Extract physical kinematics for each participating sequential input.
-        kinematics = {}
-        for idx in self.sequential_indices:
-            source_data, source_mask = sources[idx]
-            kinematics[idx] = self._extract_kinematics(idx, source_data, source_mask)
-
-        # Full attention bias over the concatenated sequence; zero-filled so any
-        # non-sequential positions or uncoupled cross blocks contribute nothing.
-        pairwise_bias = embeddings.new_zeros(
-            batch_size * self.num_heads, total_seq_len, total_seq_len
-        )
-
-        # --- Same-type blocks: each collection with itself ---
-        for idx in self.sequential_indices:
-            pt, eta, phi, mass, mask = kinematics[idx]
-            features = self.pairwise_computer(
-                (pt, eta, phi, mass), (pt, eta, phi, mass),
-                mask, mask, remove_self_pair=True,
+        if offsets[-1] != total_seq_len:
+            raise RuntimeError(
+                f"Pairwise kinematic sequence length ({offsets[-1]}) does not match "
+                f"the embedding sequence length ({total_seq_len}); the pairwise bias "
+                "would be misaligned with the attention positions."
             )
-            block_bias = self.same_type_embeddings[self.input_names[idx]](features)
-            offset = offsets[idx]
-            length = pt.shape[1]
-            pairwise_bias[:, offset:offset + length, offset:offset + length] = block_bias
 
-        # --- Cross-type blocks: coupled collections (mixed-type resonances) ---
-        for (a, b) in self.cross_pairs:
-            pt_a, eta_a, phi_a, mass_a, mask_a = kinematics[a]
-            pt_b, eta_b, phi_b, mass_b, mask_b = kinematics[b]
-            features = self.pairwise_computer(
-                (pt_a, eta_a, phi_a, mass_a), (pt_b, eta_b, phi_b, mass_b),
-                mask_a, mask_b, remove_self_pair=False,
+        by_index = {info["input_index"]: info for info in self.pairwise_collections}
+
+        if self.block_mode:
+            # ---- Block mode: per-pair-type MLPs, assembled at offsets. ----
+            kinematics = {}
+            for idx, info in by_index.items():
+                source_data, source_mask = sources[idx]
+                kinematics[idx] = self._extract_kinematics(info, source_data, source_mask)
+
+            pairwise_bias = embeddings.new_zeros(
+                batch_size * self.options.num_attention_heads, total_seq_len, total_seq_len
             )
-            block_bias = self.cross_type_embeddings[
-                self._cross_key(self.input_names[a], self.input_names[b])
-            ](features)
 
-            offset_a, offset_b = offsets[a], offsets[b]
-            len_a, len_b = pt_a.shape[1], pt_b.shape[1]
-            pairwise_bias[:, offset_a:offset_a + len_a, offset_b:offset_b + len_b] = block_bias
-            # The transposed block: features are symmetric under i<->j, so the
-            # bias for (b, a) is the transpose of the bias for (a, b).
-            pairwise_bias[:, offset_b:offset_b + len_b, offset_a:offset_a + len_a] = block_bias.transpose(1, 2)
+            # Same-type blocks: each collection with itself.
+            for idx, info in by_index.items():
+                pt, eta, phi, mass, mask = kinematics[idx]
+                features, pair_mask = self.pairwise_computer.compute_block(
+                    (pt, eta, phi, mass), (pt, eta, phi, mass),
+                    mask, mask, remove_self_pair=True,
+                )
+                block_bias = self.same_type_embeddings[info["name"]](features, pair_mask)
+                o, L = offsets[idx], lengths[idx]
+                pairwise_bias[:, o:o + L, o:o + L] = block_bias
+
+            # Cross-type blocks: resonance-coupled collection pairs.
+            for (a, b) in self.cross_pairs:
+                pt_a, eta_a, phi_a, mass_a, mask_a = kinematics[a]
+                pt_b, eta_b, phi_b, mass_b, mask_b = kinematics[b]
+                features, pair_mask = self.pairwise_computer.compute_block(
+                    (pt_a, eta_a, phi_a, mass_a), (pt_b, eta_b, phi_b, mass_b),
+                    mask_a, mask_b, remove_self_pair=False,
+                )
+                key = self._cross_key(by_index[a]["name"], by_index[b]["name"])
+                block_bias = self.cross_type_embeddings[key](features, pair_mask)
+
+                oa, ob = offsets[a], offsets[b]
+                la, lb = lengths[a], lengths[b]
+                pairwise_bias[:, oa:oa + la, ob:ob + lb] = block_bias
+                # Features are symmetric under i<->j, so the (b, a) block is
+                # the transpose of the (a, b) block.
+                pairwise_bias[:, ob:ob + lb, oa:oa + la] = block_bias.transpose(1, 2)
+
+            return embeddings, padding_masks, sequence_masks, global_masks, pairwise_bias
+
+        # ---- Unified mode: one shared MLP over the combined sequence. ----
+        segments = []
+        for input_index in range(len(self.vector_embedding_layers)):
+            source_data, source_mask = sources[input_index]
+            info = by_index.get(input_index)
+            if info is None:
+                segments.append((lengths[input_index], None))
+            else:
+                segments.append((lengths[input_index], self._extract_kinematics(info, source_data, source_mask)))
+
+        pt, eta, phi, mass, mask = combine_collection_kinematics(segments)
+        pairwise_features, pair_mask = self.pairwise_computer(pt, eta, phi, mass, mask)
+        pairwise_bias = self.pairwise_embedding(pairwise_features, pair_mask)
 
         return embeddings, padding_masks, sequence_masks, global_masks, pairwise_bias

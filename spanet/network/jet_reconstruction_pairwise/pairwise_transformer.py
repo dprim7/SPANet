@@ -51,14 +51,22 @@ class GTrXLWithPairwise(nn.Module):
         pairwise_bias: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         output = self.attention_norm(x)
-        # Convert padding_mask to float to match pairwise_bias dtype (PyTorch requirement)
-        # bool True (padding) -> float 1.0 (ignore), bool False (real) -> float 0.0 (attend)
-        padding_mask_float = padding_mask.float() if padding_mask.dtype == torch.bool else padding_mask
+        # Build an ADDITIVE float key_padding_mask so it is dtype-compatible with the
+        # float attn_mask (pairwise_bias) while still masking correctly:
+        #   padded key (True)  -> -inf  (excluded from softmax)
+        #   real key   (False) ->  0.0  (attended)
+        # A plain .float() maps padding to +1.0, which does NOT mask padded jets
+        # (it slightly boosts them) -- that was the previous bug.
+        if padding_mask.dtype == torch.bool:
+            key_padding_mask = torch.zeros_like(padding_mask, dtype=output.dtype)
+            key_padding_mask = key_padding_mask.masked_fill(padding_mask, float("-inf"))
+        else:
+            key_padding_mask = padding_mask
         output, _ = self.attention(
             output,
             output,
             output,
-            key_padding_mask=padding_mask_float,
+            key_padding_mask=key_padding_mask,
             attn_mask=pairwise_bias,
             need_weights=False,
         )

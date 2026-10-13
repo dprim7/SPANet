@@ -140,8 +140,9 @@ class Options(Namespace):
         # Pairwise Interaction Options (Particle Transformer-style)
         # =========================================================================================
 
-        # Enable pairwise interaction features in attention mechanism.
-        # When True, uses JetReconstructionModelWithPairwise instead of JetReconstructionModel.
+        # Enable pairwise interaction features in the attention mechanism.
+        # When True, JetReconstructionModel swaps in the pairwise-aware
+        # embedding and encoder (ParT-style additive attention bias).
         self.use_pairwise_interactions: bool = False
 
         # Number of pairwise features to compute between particle pairs.
@@ -151,18 +152,43 @@ class Options(Namespace):
         # Hidden dimension for pairwise feature embedding MLP.
         self.pairwise_embedding_dim: int = 8
 
-        # Which SEQUENTIAL input source to use for pairwise features.
-        # Empty string (default) uses ALL sequential inputs, each collection
-        # embedded by its own MLP. A specific input name restricts pairwise
-        # features to that single collection (legacy single-block behaviour).
+        # Which SEQUENTIAL input sources participate in pairwise features.
+        # "" or "all" (default): ALL sequential collections -- one unified
+        # N_total x N_total bias over the full concatenated sequence, covering
+        # intra- AND cross-collection pairs (each collection is denormalized
+        # with its own statistics to physical units before combining).
+        # A single name (e.g. "Jets") or a list of names restricts it.
         self.pairwise_input_source: str = ""
 
-        # Enable an independent MLP for cross-type pairwise features between two
-        # different jet collections (e.g. Jets <-> BoostedJets). Cross-type
-        # blocks are only built when a resonance in the event file is made of
-        # more than one kind of jet (a cross-type resonance). Set False to keep
-        # only the per-collection same-type blocks.
+        # Use an independent embedding MLP (each with its own masked BatchNorm)
+        # per pair-type block: one per collection (Jets-Jets, Boosted-Boosted)
+        # and one per resonance-coupled collection pair (Jets-Boosted).
+        # Different pair populations have very different kinematic
+        # distributions; per-block normalization treats each on its own terms
+        # instead of pooling them through one shared MLP. False (default)
+        # keeps the single shared MLP over all pairs.
+        self.pairwise_block_embeddings: bool = False
+
+        # In block mode, build cross-type blocks only for collection pairs
+        # coupled by a resonance in the event file (e.g. SRqqt = b:Jets +
+        # qq:BoostedJets couples Jets and BoostedJets). False: same-type
+        # blocks only.
         self.pairwise_cross_type: bool = True
+
+        # Which pairwise features to compute, as a "+"- or ","-joined token
+        # list. Tokens: kt, z, dr, m2, mink (Minkowski inner product,
+        # ln(2 p_i.p_j) = ln(m2_ij - m_i^2 - m_j^2), the PELICAN-style
+        # Lorentz invariant). Aliases: "part4" = kt,z,dr,m2 and "mink1" =
+        # mink. "" (default) = legacy behavior: the first
+        # num_pairwise_features of (kt, z, dr, m2).
+        self.pairwise_feature_set: str = ""
+
+        # PELICAN-lite: augment each standardized pairwise channel with its
+        # masked row-mean, column-mean and global-mean broadcast maps before
+        # the pair MLP -- the {identity, row-avg, col-avg, global-avg} subset
+        # of the 15 Eq(2->2) equivariant basis ops, applied once. Only
+        # conv1's input width changes; never warm-start across this flag.
+        self.pairwise_eq2to2: bool = False
 
         # =========================================================================================
         # Mixture of Experts (MoE) Options
@@ -201,7 +227,7 @@ class Options(Namespace):
 
         # Whether or not to add weight to classes based on their training data prevalence.
         self.balance_particles: bool = False
-        self.balance_particles_weighted: None|dict = None
+        self.balance_particles_weighted: Optional[dict] = None
 
         # Whether or not to add a weight to the jet multiplicity to not forget about large events.
         self.balance_jets: bool = False
